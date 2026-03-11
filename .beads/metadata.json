@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "fault_injection_lab",
+  "project_id": "ae36e211-caab-4eb8-9b1c-966d5fea34d6"
+}
