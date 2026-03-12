@@ -9,5 +9,5 @@ services:
       - "9002:9002"   # ollama proxy
       - "9003:9003"   # pokeapi proxy
     volumes:
-      - ./toxiproxy/config.json:/config.json:ro
-    command: ["-config", "/config.json", "-host", "0.0.0.0"]
+      - ../toxiproxy/config.json:/etc/toxiproxy/config.json:ro
+    command: ["-config", "/etc/toxiproxy/config.json", "-host", "0.0.0.0"]

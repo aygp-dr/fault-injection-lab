@@ -19,7 +19,7 @@ def generate(prompt: str, stream: bool = False) -> requests.Response:
 def embed(text: str) -> requests.Response:
     return requests.post(
         f"{PROXY_BASE}/api/embeddings",
-        json={"model": "nomic-embed-text", "prompt": text},
+        json={"model": "nomic-embed-text:v1.5", "prompt": text},
         timeout=10,
     )
 
@@ -35,7 +35,7 @@ def test_baseline_embed_under_100ms():
 
 def test_latency_pushes_embed_past_rtb_gate(toxi):
     """50ms injected latency should push embed past 100ms threshold."""
-    toxi.add_latency("ollama", latency_ms=60, jitter_ms=5)
+    toxi.add_latency("ollama", latency_ms=100, jitter_ms=5)
     t0 = time.monotonic()
     r = embed("East Boston waterfront")
     elapsed_ms = (time.monotonic() - t0) * 1000

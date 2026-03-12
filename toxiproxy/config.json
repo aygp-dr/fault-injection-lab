@@ -8,7 +8,7 @@
   {
     "name": "ollama",
     "listen": "0.0.0.0:9002",
-    "upstream": "localhost:11434",
+    "upstream": "host.docker.internal:11434",
     "enabled": true
   },
   {
