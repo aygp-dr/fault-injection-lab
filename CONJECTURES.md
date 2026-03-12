@@ -15,10 +15,11 @@ Each entry records the hypothesis, research verdict, and which build steps produ
 ## C-002: Ollama RTB SLA
 
 **Hypothesis**: `nomic-embed-text` embedding latency < 100ms through clean proxy.
-**Status**: OPEN — research pending
+**Status**: OPEN — research complete + empirical data, **LIKELY TRUE**
 **Build steps**: 5 (Ollama tests), 8 (latency sweep)
 **Instrumentation**: `test_baseline_embed_under_100ms` measures wall-clock; sweep produces p50/p99.
-**Research**: `docs/conjecture-c002-research.md` (pending)
+**Research**: `docs/conjecture-c002-research.md`
+**Key finding**: `test_baseline_embed_under_100ms` passed empirically. Observed baseline ~17ms (inferred from RTB breach test: 100ms injected → 117ms total). Budget: ~17ms model inference (nomic-embed-text:v1.5, 137M F16 on Apple Silicon) + ~3ms Docker networking + <1ms proxy = ~21ms. **Caveat**: Cold-start (first request after model eviction) will exceed 100ms. P99 validation requires 100-request sweep.
 
 ## C-003: Slicer JSON Validity
 
