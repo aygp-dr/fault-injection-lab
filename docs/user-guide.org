@@ -1,0 +1,1054 @@
+#+TITLE: Fault Injection Lab -- User Guide
+#+AUTHOR: fault-injection-lab
+#+DATE: 2026-03-11
+#+STARTUP: overview indent
+#+OPTIONS: toc:3 num:t
+#+PROPERTY: header-args:python  :results output :exports both
+#+PROPERTY: header-args:bash    :results output :exports both
+
+* Introduction
+:PROPERTIES:
+:CUSTOM_ID: introduction
+:END:
+
+** What is Toxiproxy?
+
+[[https://github.com/Shopify/toxiproxy][Toxiproxy]] is an open-source TCP proxy built by Shopify for simulating
+network faults. It sits between your application and an upstream service,
+forwarding traffic transparently under clean conditions. When you want to
+simulate a fault -- latency, bandwidth throttling, connection drops -- you
+add a "toxic" to the proxy via its REST API. Remove the toxic, and the
+clean path is restored immediately.
+
+#+BEGIN_EXAMPLE
+  Client  --->  Toxiproxy (:9002)  --->  Upstream (Ollama :11434)
+                    ^
+                    |
+            REST control API (:8474)
+            add/remove toxics
+#+END_EXAMPLE
+
+The key architectural property: *with no toxics enabled, the proxy is
+transparent.* Your client cannot tell it is talking through a proxy. Every
+toxic is additive -- it degrades the connection in a specific, measurable
+dimension. Removing a toxic fully restores the clean path with no residual
+effects.
+
+** When to use fault injection testing
+
+Fault injection testing answers the question: "What happens to my
+application when the network misbehaves?" Specifically, you should use it
+when:
+
+- You depend on an external API (REST, gRPC, database) and need to verify
+  your timeout, retry, and fallback logic actually works.
+- You have a latency SLA (e.g., embeddings must return in under 100ms) and
+  want to prove that injected delays push you past the threshold.
+- You want to test how your code handles partial responses, slow downloads,
+  or abrupt connection drops -- without modifying the upstream service.
+- You need reproducible fault conditions in local development, not random
+  chaos in production.
+
+This guide walks through the fault-injection-lab project, which
+demonstrates Toxiproxy in front of real APIs (Ollama, GitHub, PokeAPI).
+The working example uses Ollama, a local LLM inference server, because it
+runs on localhost over plain HTTP -- avoiding the TLS complications that
+affect HTTPS upstreams.
+
+* Prerequisites
+:PROPERTIES:
+:CUSTOM_ID: prerequisites
+:END:
+
+You need the following installed on your machine before starting:
+
+| Tool              | Version  | Purpose                                       |
+|-------------------+----------+-----------------------------------------------|
+| Docker + Compose  | v2+      | Runs Toxiproxy in a container                 |
+| Python            | 3.11+    | Test code and control layer                   |
+| uv                | latest   | Python package manager (replaces pip/venv)    |
+| Ollama            | latest   | Local LLM inference server (working example)  |
+
+** Install and verify each prerequisite
+
+#+BEGIN_SRC bash
+# Docker
+docker --version          # Docker version 24.x or later
+docker compose version    # Docker Compose version v2.x
+
+# Python
+python3 --version         # Python 3.11+
+
+# uv
+uv --version              # uv 0.x
+
+# Ollama
+ollama --version          # ollama version 0.x
+#+END_SRC
+
+** Pull the required Ollama models
+
+The test suite uses two models. Pull them before running tests:
+
+#+BEGIN_SRC bash
+ollama pull qwen3:0.6b
+ollama pull nomic-embed-text:v1.5
+#+END_SRC
+
+Note the versioned tag =nomic-embed-text:v1.5=. Using the bare name
+=nomic-embed-text= may resolve to a different version depending on when
+you pulled it. Pin to the version tag for reproducible results.
+
+* Getting Started
+:PROPERTIES:
+:CUSTOM_ID: getting-started
+:END:
+
+** Clone and install
+
+#+BEGIN_SRC bash
+git clone https://github.com/aygp-dr/fault-injection-lab.git
+cd fault-injection-lab
+
+# Install Python dependencies
+uv sync
+#+END_SRC
+
+The =pyproject.toml= declares the dependencies: =requests=, =pytest=, and
+=matplotlib=. Running =uv sync= creates a virtual environment and installs
+them.
+
+** Start Toxiproxy
+
+Toxiproxy runs as a Docker container. The project provides a Docker
+Compose file that configures the proxy with three named upstreams:
+
+#+BEGIN_SRC bash
+docker compose -f docker/docker-compose.yml up -d
+#+END_SRC
+
+This starts Toxiproxy with the following port mapping:
+
+| Port | Purpose                    |
+|------+----------------------------|
+| 8474 | Toxiproxy REST control API |
+| 9001 | Proxy to GitHub API        |
+| 9002 | Proxy to Ollama            |
+| 9003 | Proxy to PokeAPI           |
+
+** Verify with a health check
+
+Confirm Toxiproxy is running and the proxies are registered:
+
+#+BEGIN_SRC bash
+curl -s http://localhost:8474/proxies | python3 -m json.tool
+#+END_SRC
+
+You should see a JSON object with three keys: =github=, =ollama=, and
+=pokeapi=. Each entry shows the listen address and upstream target.
+
+You can also verify programmatically using the control layer:
+
+#+BEGIN_SRC python
+from fault_control.toxiproxy import ToxiproxyController
+
+toxi = ToxiproxyController()
+print(toxi.health_check())  # True if Toxiproxy is reachable
+#+END_SRC
+
+** Verify the Ollama proxy path
+
+With Ollama running on your host, send a request through the proxy:
+
+#+BEGIN_SRC bash
+curl -s http://localhost:9002/api/tags | python3 -m json.tool | head -20
+#+END_SRC
+
+This should return the list of models available in your Ollama instance.
+If you see a response, the proxy is forwarding traffic correctly.
+
+* Tutorial: Your First Fault Injection Test
+:PROPERTIES:
+:CUSTOM_ID: tutorial
+:END:
+
+This section walks through =tests/test_ollama.py= step by step. By the
+end, you will understand how to write a fault injection test for any
+upstream service.
+
+** The test structure
+
+Every fault injection test follows the same pattern:
+
+1. *Baseline*: Make a request through the clean proxy. Measure the result
+   (status code, latency, payload).
+2. *Inject*: Add a toxic via the control API.
+3. *Degraded*: Make the same request. Measure the degraded result.
+4. *Assert*: Verify the fault had the expected effect (slower, failed,
+   truncated).
+5. *Cleanup*: Remove the toxic so the next test starts clean.
+
+** The conftest.py fixture pattern
+
+The cleanup step is handled automatically by a pytest fixture in
+=tests/conftest.py=:
+
+#+BEGIN_SRC python
+import pytest
+from fault_control.toxiproxy import ToxiproxyController
+
+TOXI = ToxiproxyController()
+
+@pytest.fixture(autouse=True)
+def clean_toxics():
+    TOXI.reset_all()
+    yield
+    TOXI.reset_all()
+
+@pytest.fixture
+def toxi():
+    return TOXI
+#+END_SRC
+
+Two fixtures are defined here:
+
+- =clean_toxics= has =autouse=True=, which means it runs for every test
+  function automatically. It calls =reset_all()= before and after each
+  test. This removes all active toxics and re-enables all proxies,
+  guaranteeing each test starts with a clean proxy.
+
+- =toxi= provides the =ToxiproxyController= instance to any test that
+  requests it by name. Tests that only need the clean path (baseline
+  tests) do not declare the =toxi= parameter and do not need it.
+
+The =reset_all()= method iterates over every proxy, removes every toxic,
+and re-enables the proxy. This is deliberate -- the teardown ensures no
+toxic leaks between tests, even if a test fails mid-execution.
+
+** Helper functions
+
+The test file defines two helper functions that encapsulate the HTTP calls:
+
+#+BEGIN_SRC python
+PROXY_BASE = "http://localhost:9002"
+MODEL = "qwen3:0.6b"
+
+def generate(prompt: str, stream: bool = False) -> requests.Response:
+    return requests.post(
+        f"{PROXY_BASE}/api/generate",
+        json={"model": MODEL, "prompt": prompt, "stream": stream},
+        timeout=30,
+    )
+
+def embed(text: str) -> requests.Response:
+    return requests.post(
+        f"{PROXY_BASE}/api/embeddings",
+        json={"model": "nomic-embed-text:v1.5", "prompt": text},
+        timeout=10,
+    )
+#+END_SRC
+
+Notice: all requests go to =http://localhost:9002= (the Toxiproxy port),
+not =http://localhost:11434= (Ollama directly). The proxy is transparent
+-- same HTTP API, same request format, same response format. The only
+difference is the port.
+
+** Test 1: Baseline embedding latency
+
+#+BEGIN_SRC python
+def test_baseline_embed_under_100ms():
+    """RTB gate: embedding latency must be < 100ms without fault."""
+    t0 = time.monotonic()
+    r = embed("East Boston waterfront")
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    assert r.status_code == 200
+    assert elapsed_ms < 100, f"Embedding took {elapsed_ms:.1f}ms -- fails RTB SLA"
+#+END_SRC
+
+This is a pure baseline test -- no toxics are injected. It verifies that
+the clean proxy path meets the latency SLA (<100ms for an embedding
+call). If this test fails, the problem is in Ollama or the model, not in
+Toxiproxy.
+
+Notice this test does not declare a =toxi= parameter. The =autouse=
+fixture still resets toxics before and after, but the test itself does not
+inject any faults.
+
+** Test 2: Latency injection pushes past the SLA
+
+#+BEGIN_SRC python
+def test_latency_pushes_embed_past_rtb_gate(toxi):
+    """50ms injected latency should push embed past 100ms threshold."""
+    toxi.add_latency("ollama", latency_ms=100, jitter_ms=5)
+    t0 = time.monotonic()
+    r = embed("East Boston waterfront")
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    assert r.status_code == 200
+    assert elapsed_ms > 100, f"Expected RTB breach, got {elapsed_ms:.1f}ms"
+#+END_SRC
+
+This test declares the =toxi= parameter, which gives it access to the
+=ToxiproxyController=. It injects 100ms of latency (with 5ms jitter) on
+the =ollama= proxy, then makes the same embedding call. The assertion
+verifies the total elapsed time exceeds 100ms -- the SLA is breached.
+
+The pattern is: baseline passes the SLA, degraded fails it. This proves
+the SLA measurement is meaningful and that your code would detect a
+real network degradation.
+
+** Test 3: Slicer disrupts streaming generation
+
+#+BEGIN_SRC python
+def test_slicer_disrupts_streaming_generation(toxi):
+    """
+    Slicer breaks TCP stream into 1-byte chunks with 500us delay between each.
+    Client must reassemble correctly; validate response is still parseable JSON.
+    """
+    toxi.add_slicer("ollama", avg_size=1, delay_us=500)
+    r = generate("count to three", stream=False)
+    assert r.status_code == 200
+    body = r.json()
+    assert "response" in body
+    assert len(body["response"]) > 0
+#+END_SRC
+
+The slicer toxic fragments the TCP stream into tiny chunks. This simulates
+a degraded network link where packets arrive in small pieces. The test
+verifies that the HTTP client (=requests=) reassembles the fragments
+correctly and the JSON response parses without error.
+
+This is a data integrity test, not a latency test. The slicer does not
+corrupt data -- TCP guarantees in-order delivery -- but it stress-tests
+the client's ability to handle fragmented reads.
+
+** Test 4: Timeout kills a long-running generation
+
+#+BEGIN_SRC python
+def test_timeout_mid_generation_raises(toxi):
+    """2000ms timeout toxic; long generation should not complete."""
+    toxi.add_timeout("ollama", timeout_ms=2000)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        generate("write me a sonnet about FreeBSD jails", stream=False)
+#+END_SRC
+
+The timeout toxic drops the connection after 2000ms with no data. A long
+generation prompt (writing a sonnet) should take longer than 2 seconds,
+so the connection is killed mid-response. The test verifies that the
+client raises =ConnectionError=.
+
+** Test 5: Bandwidth cap slows a large response
+
+#+BEGIN_SRC python
+def test_bandwidth_cap_slows_large_response(toxi):
+    """10 KB/s cap on a verbose generation; must take > 1s."""
+    toxi.add_bandwidth("ollama", rate_kbps=10)
+    t0 = time.monotonic()
+    r = generate("list every US state capital", stream=False)
+    elapsed = time.monotonic() - t0
+    assert r.status_code == 200
+    assert elapsed > 1.0, f"Expected throttled response, got {elapsed:.2f}s"
+#+END_SRC
+
+The bandwidth toxic limits throughput to 10 KB/s. A verbose prompt
+("list every US state capital") produces a response large enough that
+the bandwidth cap forces the download to take over 1 second. The
+response is still valid -- just slow.
+
+** Running the tests
+
+With Toxiproxy and Ollama both running:
+
+#+BEGIN_SRC bash
+uv run pytest tests/test_ollama.py -v
+#+END_SRC
+
+Expected output: 5 tests, all passing.
+
+* Toxic Reference Guide
+:PROPERTIES:
+:CUSTOM_ID: toxic-reference
+:END:
+
+Each toxic type targets a specific dimension of network degradation.
+Toxics are added to a named proxy via the REST API (or the Python control
+layer) and removed individually or via =reset_all()=.
+
+All toxics in this project are applied to the =downstream= stream (data
+flowing from upstream to client). You can also apply toxics to the
+=upstream= stream (data flowing from client to upstream), but the
+downstream direction is the more common choice for testing response
+handling.
+
+** Latency
+:PROPERTIES:
+:CUSTOM_ID: toxic-latency
+:END:
+
+Adds a fixed delay to every chunk of data passing through the proxy.
+
+*** Parameters
+
+| Parameter | Type | Default | Description                              |
+|-----------+------+---------+------------------------------------------|
+| latency   | int  | 0       | Base delay in milliseconds               |
+| jitter    | int  | 0       | Random variation in ms: uniform [-j, +j) |
+
+*** Python API
+
+#+BEGIN_SRC python
+toxi.add_latency("ollama", latency_ms=300, jitter_ms=20)
+#+END_SRC
+
+*** Behavior
+
+The latency toxic delays each TCP chunk by =latency +/- jitter=
+milliseconds. The jitter is drawn from a uniform distribution, not
+Gaussian.
+
+For small API responses (under 32KB), the entire HTTP response typically
+arrives as a single TCP chunk on localhost. The delay is applied once,
+making the observed latency closely match =baseline + injected +/- jitter=.
+
+*** Caveats
+
+*Timestamp-aware delay.* Internally, the toxic tracks how long each chunk
+has been waiting in the proxy pipeline. If a chunk has already waited
+50ms in the buffer, and the target delay is 300ms, the toxic only sleeps
+for 250ms. This prevents compounding when multiple toxics are chained
+together.
+
+*Per-chunk, not per-request.* The delay applies to each TCP chunk
+independently. For large responses that span multiple chunks, the first
+chunk receives the full delay, but subsequent chunks that have already
+been buffered may pass through with reduced or zero additional delay.
+The total wall-clock delay is dominated by the first chunk.
+
+*First-request overhead.* The first request on a new connection includes
+TCP handshake time. Use =requests.Session= and send warmup requests
+before measuring latency to isolate the toxic's effect.
+
+** Bandwidth
+:PROPERTIES:
+:CUSTOM_ID: toxic-bandwidth
+:END:
+
+Caps throughput to a specified rate in kilobytes per second.
+
+*** Parameters
+
+| Parameter | Type | Default | Description                |
+|-----------+------+---------+----------------------------|
+| rate      | int  | 0       | Maximum throughput in KB/s |
+
+*** Python API
+
+#+BEGIN_SRC python
+toxi.add_bandwidth("ollama", rate_kbps=10)
+#+END_SRC
+
+*** Behavior
+
+The bandwidth toxic rate-limits data flowing through the proxy. At 10
+KB/s, a 50KB response takes approximately 5 seconds to deliver. The
+response arrives complete and uncorrupted -- just slowly.
+
+*** Caveats
+
+*HTTP header overhead.* The bandwidth limit applies to the raw TCP
+stream, which includes HTTP headers, not just the response body. A
+response with a 1KB body but 500 bytes of headers transfers 1.5KB at the
+capped rate. For very low rates (1 KB/s), even small responses take
+longer than you might expect from the body size alone.
+
+*Interaction with latency.* If a bandwidth toxic is added before a
+latency toxic in the pipeline, the bandwidth delay may "absorb" the
+latency delay. The latency toxic subtracts time already elapsed, so if
+the chunk was delayed by bandwidth longer than the latency target, the
+latency toxic becomes a no-op. Add latency first, then bandwidth, if
+you want both to apply independently.
+
+** Timeout
+:PROPERTIES:
+:CUSTOM_ID: toxic-timeout
+:END:
+
+Drops the connection after a specified delay with no response data.
+
+*** Parameters
+
+| Parameter | Type | Default | Description                                   |
+|-----------+------+---------+-----------------------------------------------|
+| timeout   | int  | 0       | Milliseconds to wait before dropping the conn |
+
+*** Python API
+
+#+BEGIN_SRC python
+toxi.add_timeout("ollama", timeout_ms=2000)
+#+END_SRC
+
+*** Behavior
+
+The timeout toxic waits for =timeout_ms= milliseconds, then closes the
+TCP connection. No data is forwarded during this period. The client sees
+a =ConnectionError= (connection reset) after the timeout elapses.
+
+This simulates an upstream that accepts the connection but never responds
+-- common in overloaded services, hung database connections, or network
+black holes.
+
+*** Caveats
+
+*Client timeout vs toxic timeout.* Your client's =timeout= parameter
+and the toxic's =timeout_ms= interact. If the client timeout is shorter
+than the toxic timeout, the client raises =ReadTimeout= before the toxic
+drops the connection. If the client timeout is longer, the client sees
+=ConnectionError= when the toxic closes the connection. Set the client
+timeout longer than the toxic timeout to test the toxic's effect.
+
+** Slicer
+:PROPERTIES:
+:CUSTOM_ID: toxic-slicer
+:END:
+
+Fragments the TCP stream into small chunks with optional inter-chunk
+delay.
+
+*** Parameters
+
+| Parameter      | Type | Default | Description                         |
+|----------------+------+---------+-------------------------------------|
+| average_size   | int  | 1       | Average chunk size in bytes         |
+| size_variation | int  | 0       | +/- bytes of variation in chunk size |
+| delay          | int  | 0       | Microseconds of delay between chunks |
+
+*** Python API
+
+#+BEGIN_SRC python
+toxi.add_slicer("ollama", avg_size=1, delay_us=500)
+#+END_SRC
+
+*** Behavior
+
+The slicer takes each TCP segment passing through the proxy and breaks
+it into smaller pieces. With =avg_size=1= and =size_variation=0=, every
+byte is delivered individually. With =delay_us=500=, there is a 0.5ms
+pause between each byte.
+
+The slicer never modifies, drops, reorders, or duplicates any bytes. It
+only changes the timing and segmentation of delivery. TCP guarantees
+in-order, reliable delivery, so the receiving client reassembles the
+original byte stream correctly.
+
+*** Caveats
+
+*JSON validity is preserved.* Despite fragmenting data into single-byte
+chunks, the HTTP client's buffered reader reassembles the complete
+response before returning it. Calling =response.json()= works correctly
+because =requests= reads the full response body regardless of TCP
+segmentation.
+
+*Delay adds up on large responses.* With =avg_size=1= and =delay_us=500=:
+- A 1KB response adds ~500ms of delay (1,000 chunks x 0.5ms).
+- A 10KB response adds ~5s of delay.
+- A 100KB response adds ~50s of delay.
+
+Set your client timeout generously when using the slicer with non-zero
+delay. With =delay_us=0=, the overhead is negligible.
+
+*Simulates fragmented networks, not corruption.* The slicer tests your
+client's ability to handle many small TCP reads. It is useful for
+simulating lossy WAN links, chatty TCP sessions, or a GPU inference node
+writing tokens one at a time.
+
+** Disable / Enable (Proxy-Level Kill Switch)
+:PROPERTIES:
+:CUSTOM_ID: toxic-disable
+:END:
+
+Disabling a proxy is not a toxic -- it is a proxy-level operation that
+refuses all connections.
+
+*** Python API
+
+#+BEGIN_SRC python
+toxi.disable("ollama")    # All connections to :9002 are refused
+toxi.enable("ollama")     # Connections are accepted again
+#+END_SRC
+
+*** Behavior
+
+When a proxy is disabled, any new connection attempt to its listen port
+is refused immediately. The client sees =ConnectionError= (connection
+refused). Existing connections that were established before the disable
+may continue to work until they are closed.
+
+Re-enabling the proxy restores normal operation. New connections are
+accepted and forwarded to the upstream.
+
+*** Use case
+
+Disable/enable is the simplest way to test retry and failover logic:
+
+#+BEGIN_SRC python
+def test_retry_across_outage(toxi):
+    toxi.disable("ollama")
+
+    # First attempt fails
+    with pytest.raises(requests.exceptions.ConnectionError):
+        embed("test")
+
+    # Simulate recovery
+    time.sleep(1)
+    toxi.enable("ollama")
+
+    # Retry succeeds
+    r = embed("test")
+    assert r.status_code == 200
+#+END_SRC
+
+* Patterns and Best Practices
+:PROPERTIES:
+:CUSTOM_ID: patterns
+:END:
+
+** Always reset toxics between tests
+
+The =autouse= fixture in =conftest.py= is non-negotiable. Without it,
+a toxic left over from one test contaminates the next. The reset runs
+both before and after each test:
+
+- *Before*: Catches cases where a previous test failed mid-execution and
+  did not clean up.
+- *After*: Normal cleanup after the test completes.
+
+If you are adding fault injection to an existing test suite, add this
+fixture to your =conftest.py=:
+
+#+BEGIN_SRC python
+@pytest.fixture(autouse=True)
+def clean_toxics():
+    TOXI.reset_all()
+    yield
+    TOXI.reset_all()
+#+END_SRC
+
+** Use session reuse for accurate latency measurement
+
+Python's =requests= library creates a new TCP connection for each
+request by default (unless you use a =Session=). The first request
+includes TCP handshake overhead (~1-5ms on localhost), which inflates
+baseline measurements and makes latency deltas noisier.
+
+For latency-sensitive tests, use =requests.Session= and send warmup
+requests before measuring:
+
+#+BEGIN_SRC python
+import requests
+
+session = requests.Session()
+
+# Warmup: establish the TCP connection
+for _ in range(3):
+    session.post("http://localhost:9002/api/embeddings",
+                 json={"model": "nomic-embed-text:v1.5", "prompt": "warmup"},
+                 timeout=10)
+
+# Now measure: connection is reused, no handshake overhead
+t0 = time.monotonic()
+r = session.post("http://localhost:9002/api/embeddings",
+                 json={"model": "nomic-embed-text:v1.5", "prompt": "test"},
+                 timeout=10)
+elapsed_ms = (time.monotonic() - t0) * 1000
+#+END_SRC
+
+** Warm up models before benchmarking
+
+Ollama loads models into memory on first use. The first embedding or
+generation call after a model has been idle may take significantly longer
+than subsequent calls due to model loading. Always send a throwaway
+request before your baseline measurement:
+
+#+BEGIN_SRC python
+def test_latency_with_warmup(toxi):
+    # Warmup: ensure model is loaded
+    embed("warmup")
+
+    # Baseline measurement
+    t0 = time.monotonic()
+    embed("East Boston waterfront")
+    baseline_ms = (time.monotonic() - t0) * 1000
+
+    # Inject fault and re-measure
+    toxi.add_latency("ollama", latency_ms=100)
+    t0 = time.monotonic()
+    embed("East Boston waterfront")
+    degraded_ms = (time.monotonic() - t0) * 1000
+
+    delta = degraded_ms - baseline_ms
+    assert 80 < delta < 150, f"Expected ~100ms delta, got {delta:.0f}ms"
+#+END_SRC
+
+** Test both degraded AND recovered states
+
+A good fault injection test does not just verify that faults cause
+problems. It also verifies that removing the fault restores normal
+operation. This catches hysteresis bugs -- cases where your client
+caches error states, breaks connection pools, or fails to retry after
+recovery.
+
+#+BEGIN_SRC python
+def test_degrade_then_recover(toxi):
+    # Baseline: clean path
+    r1 = embed("test")
+    assert r1.status_code == 200
+
+    # Degrade: add latency
+    toxi.add_latency("ollama", latency_ms=500)
+    t0 = time.monotonic()
+    r2 = embed("test")
+    assert (time.monotonic() - t0) > 0.4
+
+    # Recover: remove the toxic
+    toxi.remove_toxic("ollama", "latency_ollama")
+    t0 = time.monotonic()
+    r3 = embed("test")
+    recovered_ms = (time.monotonic() - t0) * 1000
+    assert recovered_ms < 100, "Recovery failed -- latency still elevated"
+#+END_SRC
+
+** Use descriptive assertion messages
+
+When a fault injection test fails, the failure message should tell you
+whether the fault did not apply or the fault was too strong. Include the
+measured value and the expected range:
+
+#+BEGIN_SRC python
+# Bad
+assert elapsed > 1.0
+
+# Good
+assert elapsed > 1.0, f"Expected throttled response >1s, got {elapsed:.2f}s"
+#+END_SRC
+
+** Prefer plain HTTP upstreams
+
+Toxiproxy operates at the TCP level. It does not terminate TLS. When you
+proxy an HTTPS upstream (like =api.github.com:443=), the client must
+send plain HTTP to the proxy port, and Toxiproxy forwards the raw TCP to
+the upstream. This works for simple cases, but HTTPS upstreams expect a
+TLS handshake from the connecting client. Since Toxiproxy does not
+perform TLS termination, the upstream sees a plain HTTP request and
+typically returns a 400 Bad Request.
+
+For reliable testing, use plain HTTP upstreams:
+
+| Upstream          | Protocol | Fault injection works? |
+|-------------------+----------+------------------------|
+| Ollama (local)    | HTTP     | Yes -- fully supported |
+| Prism mock        | HTTP     | Yes -- fully supported |
+| api.github.com    | HTTPS    | No -- 400 Bad Request  |
+| pokeapi.co        | HTTPS    | No -- 400 Bad Request  |
+
+If you must test against an HTTPS upstream, consider running a local mock
+server (like [[https://docs.stoplight.io/docs/prism/][Prism]]) that speaks plain HTTP, or use a MITM proxy for TLS
+termination.
+
+* Adapting for Your Own Project
+:PROPERTIES:
+:CUSTOM_ID: adapting
+:END:
+
+To add Toxiproxy fault injection to your own project, follow these steps.
+
+** Step 1: Define your proxy in config.json
+
+Create a =toxiproxy/config.json= with your upstream:
+
+#+BEGIN_SRC json
+[
+  {
+    "name": "myservice",
+    "listen": "0.0.0.0:9010",
+    "upstream": "host.docker.internal:8080",
+    "enabled": true
+  }
+]
+#+END_SRC
+
+The =upstream= field is the address Toxiproxy connects to. If your
+service runs on the host machine (not in Docker), use
+=host.docker.internal= instead of =localhost= -- see the Troubleshooting
+section.
+
+** Step 2: Add the port to docker-compose.yml
+
+#+BEGIN_SRC yaml
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8474:8474"
+      - "9010:9010"
+    volumes:
+      - ./toxiproxy/config.json:/etc/toxiproxy/config.json:ro
+    command: ["-config", "/etc/toxiproxy/config.json", "-host", "0.0.0.0"]
+#+END_SRC
+
+** Step 3: Point your client at the proxy
+
+Change your base URL from =http://localhost:8080= to
+=http://localhost:9010=. Everything else stays the same.
+
+** Step 4: Copy the control layer and fixtures
+
+Copy =fault_control/toxiproxy.py= and =tests/conftest.py= into your
+project. The control layer has no external dependencies beyond =requests=.
+
+** Step 5: Write your tests
+
+Follow the baseline/inject/degrade/assert pattern from the tutorial:
+
+#+BEGIN_SRC python
+import time
+import pytest
+import requests
+
+PROXY_BASE = "http://localhost:9010"
+
+def call_my_service():
+    return requests.get(f"{PROXY_BASE}/api/health", timeout=10)
+
+def test_baseline_responds_quickly():
+    t0 = time.monotonic()
+    r = call_my_service()
+    assert r.status_code == 200
+    assert (time.monotonic() - t0) < 0.5
+
+def test_latency_degrades_response(toxi):
+    toxi.add_latency("myservice", latency_ms=500)
+    t0 = time.monotonic()
+    r = call_my_service()
+    assert r.status_code == 200
+    assert (time.monotonic() - t0) > 0.4
+
+def test_outage_raises(toxi):
+    toxi.disable("myservice")
+    with pytest.raises(requests.exceptions.ConnectionError):
+        call_my_service()
+#+END_SRC
+
+* Troubleshooting
+:PROPERTIES:
+:CUSTOM_ID: troubleshooting
+:END:
+
+** HTTPS upstreams return 400 Bad Request
+:PROPERTIES:
+:CUSTOM_ID: trouble-tls
+:END:
+
+*Symptom*: Requests through the proxy to GitHub (=:9001=) or PokeAPI
+(=:9003=) return HTTP 400 with an error about bad request or invalid
+protocol.
+
+*Cause*: Toxiproxy operates at the TCP level. It does not perform TLS
+termination. When the upstream expects HTTPS (=api.github.com:443=,
+=pokeapi.co:443=), the proxy forwards raw TCP bytes. The upstream
+server expects a TLS ClientHello but receives a plain HTTP request,
+and rejects it.
+
+*Solution*: Use plain HTTP upstreams for fault injection testing.
+Ollama runs on plain HTTP by default (=localhost:11434=). For other
+services, run a local mock server like Prism:
+
+#+BEGIN_SRC bash
+# Start Prism as a mock server for PokeAPI
+docker run --rm -p 4010:4010 stoplight/prism:4 mock -h 0.0.0.0 /spec/pokeapi.yaml
+#+END_SRC
+
+Then point your Toxiproxy config at =prism:4010= instead of
+=pokeapi.co:443=.
+
+** Docker localhost vs host.docker.internal
+:PROPERTIES:
+:CUSTOM_ID: trouble-docker-localhost
+:END:
+
+*Symptom*: Toxiproxy cannot reach an upstream running on your host
+machine. Connection refused errors in Toxiproxy logs.
+
+*Cause*: Inside the Docker container, =localhost= refers to the
+container itself, not your host machine. An upstream configured as
+=localhost:11434= tells Toxiproxy to connect to port 11434 inside its
+own container -- which has nothing listening.
+
+*Solution*: Use =host.docker.internal= as the upstream hostname. This
+is a Docker-provided DNS name that resolves to the host machine.
+
+The project's actual config uses this pattern:
+
+#+BEGIN_SRC json
+{
+  "name": "ollama",
+  "listen": "0.0.0.0:9002",
+  "upstream": "host.docker.internal:11434",
+  "enabled": true
+}
+#+END_SRC
+
+On Linux, you may need to add =--add-host=host.docker.internal:host-gateway=
+to your Docker run command, or add the following to your compose file:
+
+#+BEGIN_SRC yaml
+services:
+  toxiproxy:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+#+END_SRC
+
+** Model not found in Ollama
+:PROPERTIES:
+:CUSTOM_ID: trouble-ollama-model
+:END:
+
+*Symptom*: Tests fail with a 404 or error message about the model not
+being found, even though you pulled it.
+
+*Cause*: The model tag may not match. Pulling =nomic-embed-text=
+without a version tag may resolve to a different version than the tests
+expect.
+
+*Solution*: Use the exact versioned tag specified in the test file:
+
+#+BEGIN_SRC bash
+ollama pull nomic-embed-text:v1.5
+ollama pull qwen3:0.6b
+#+END_SRC
+
+Verify the models are available:
+
+#+BEGIN_SRC bash
+ollama list
+#+END_SRC
+
+The output should include =nomic-embed-text:v1.5= and =qwen3:0.6b=.
+
+If you want to use different models, update the =MODEL= constant and
+=embed()= function in =tests/test_ollama.py=.
+
+** Toxiproxy control API returns empty proxies
+:PROPERTIES:
+:CUSTOM_ID: trouble-empty-proxies
+:END:
+
+*Symptom*: =curl http://localhost:8474/proxies= returns ={}= (empty
+object) instead of the three configured proxies.
+
+*Cause*: The config file is not mounted correctly into the container.
+Toxiproxy starts but has no proxy definitions.
+
+*Solution*: Check the volume mount in your =docker-compose.yml=. The
+config file must be mounted at the path specified in the =command=:
+
+#+BEGIN_SRC yaml
+volumes:
+  - ./toxiproxy/config.json:/etc/toxiproxy/config.json:ro
+command: ["-config", "/etc/toxiproxy/config.json", "-host", "0.0.0.0"]
+#+END_SRC
+
+Verify the mount is correct:
+
+#+BEGIN_SRC bash
+# Check that the config file exists on the host
+ls -la toxiproxy/config.json
+
+# Check that the container can see it
+docker compose -f docker/docker-compose.yml exec toxiproxy cat /etc/toxiproxy/config.json
+#+END_SRC
+
+If the file exists but the proxies are still empty, verify the JSON is
+valid:
+
+#+BEGIN_SRC bash
+python3 -m json.tool toxiproxy/config.json
+#+END_SRC
+
+** Tests hang or time out
+:PROPERTIES:
+:CUSTOM_ID: trouble-timeout
+:END:
+
+*Symptom*: Tests take much longer than expected or hang indefinitely.
+
+*Cause*: Several possible causes:
+
+- *Ollama model not loaded*: The first request to a model triggers a
+  load, which can take 10-30 seconds. Solution: run a warmup request
+  first, or increase the test timeout.
+- *Slicer with high delay*: A slicer with =delay_us=500= on a 100KB
+  response adds ~50 seconds of delay. Solution: reduce =delay_us= or
+  use a smaller response endpoint.
+- *Toxic removal during active traffic*: Toxiproxy can hang when
+  removing toxics while requests are in flight (Issue #412). Solution:
+  ensure no requests are active when =reset_all()= runs. The =autouse=
+  fixture handles this by resetting at test boundaries.
+
+*Workaround*: Set generous but finite timeouts on all requests:
+
+#+BEGIN_SRC python
+requests.post(url, json=payload, timeout=30)  # 30-second timeout
+#+END_SRC
+
+Never use =timeout=None= in fault injection tests. An undetected hang
+will block your entire test suite.
+
+* Quick Reference
+:PROPERTIES:
+:CUSTOM_ID: quick-reference
+:END:
+
+** Toxic summary table
+
+| Toxic     | Effect                         | Key Parameter    | Client sees           |
+|-----------+--------------------------------+------------------+-----------------------|
+| latency   | Adds delay per chunk           | =latency_ms=     | Slower responses      |
+| bandwidth | Caps throughput in KB/s        | =rate_kbps=      | Slow large downloads  |
+| timeout   | Drops connection after delay   | =timeout_ms=     | =ConnectionError=     |
+| slicer    | Fragments TCP into tiny chunks | =avg_size=       | Slow but valid data   |
+| disable   | Refuses all new connections    | (proxy-level)    | =ConnectionError=     |
+
+** Control API endpoints
+
+| Method | Path                                  | Purpose                   |
+|--------+---------------------------------------+---------------------------|
+| GET    | /proxies                              | List all proxies          |
+| GET    | /proxies/{name}                       | Get proxy details         |
+| PATCH  | /proxies/{name}                       | Enable/disable proxy      |
+| GET    | /proxies/{name}/toxics                | List active toxics        |
+| POST   | /proxies/{name}/toxics                | Add a toxic               |
+| DELETE | /proxies/{name}/toxics/{toxic_name}   | Remove a toxic            |
+
+** Port map
+
+| Port | Service              |
+|------+----------------------|
+| 8474 | Toxiproxy control    |
+| 9001 | Proxy: GitHub API    |
+| 9002 | Proxy: Ollama        |
+| 9003 | Proxy: PokeAPI       |
+
+* Further Reading
+:PROPERTIES:
+:CUSTOM_ID: further-reading
+:END:
+
+- [[https://github.com/Shopify/toxiproxy][Toxiproxy GitHub repository and REST API documentation]]
+- [[https://github.com/ollama/ollama/blob/main/docs/api.md][Ollama API documentation]]
+- [[https://docs.stoplight.io/docs/prism/][Prism documentation]] -- mock and proxy server for OpenAPI specs
+- Project research documents in =docs/=:
+  - =conjecture-c001-research.md= -- detailed analysis of latency toxic internals
+  - =conjecture-c003-research.md= -- detailed analysis of slicer toxic and TCP reassembly
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

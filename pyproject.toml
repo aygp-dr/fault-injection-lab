@@ -2,4 +2,4 @@
 name = "fault-injection-lab"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["requests", "pytest"]
+dependencies = ["requests", "pytest", "matplotlib"]

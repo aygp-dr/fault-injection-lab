@@ -1,0 +1,675 @@
+#+TITLE: Architecture Decision Record and Deployment Guide
+#+SUBTITLE: Fault Injection Lab -- Toxiproxy in Front of Real APIs
+#+AUTHOR: AWS Solutions Architecture Review
+#+DATE: 2026-03-11
+#+STARTUP: overview indent
+#+OPTIONS: toc:3 num:t
+
+* System Architecture
+:PROPERTIES:
+:CUSTOM_ID: system-architecture
+:END:
+
+** Overview
+
+The fault-injection-lab places Shopify's Toxiproxy as a TCP-level proxy between
+Python test clients and three upstream APIs: GitHub REST API, Ollama (local LLM
+inference), and PokeAPI. A Python control layer (~fault_control/toxiproxy.py~)
+drives the Toxiproxy REST API to inject, modify, and remove fault conditions
+(toxics) on a per-test basis.
+
+The canonical specification lives in ~spec.org~. All source files tangle from it
+via org-babel.
+
+** Data Flow Diagram
+
+#+BEGIN_SRC text
+                                    CONTROL PLANE
+                                    =============
+
+   pytest fixtures                  Toxiproxy REST API
+   tests/conftest.py  -----------> http://localhost:8474
+         |                                |
+         | (imports)                      | (manages toxics)
+         v                                v
+   fault_control/             +-------------------------+
+   toxiproxy.py               |      Toxiproxy          |
+   ToxiproxyController        |   (Docker container)    |
+                              +-------------------------+
+
+                                    DATA PLANE
+                                    ==========
+
+   Python test client         Toxiproxy listen ports       Upstream services
+   (requests library)         (inside container)           (real or mock)
+   ==================         ====================         ================
+
+   http://localhost:9001 ---> 0.0.0.0:9001 ("github")  -> api.github.com:443
+   http://localhost:9002 ---> 0.0.0.0:9002 ("ollama")  -> host.docker.internal:11434
+   http://localhost:9003 ---> 0.0.0.0:9003 ("pokeapi") -> pokeapi.co:443
+
+   When toxics are active, the proxy degrades the TCP stream between
+   listen port and upstream according to the toxic configuration.
+   When no toxics are active, the proxy is transparent (clean path).
+#+END_SRC
+
+The foundational axiom from ~CLAUDE.md~ governs this design:
+
+#+BEGIN_QUOTE
+The proxy layer must be transparent to the client under clean conditions.
+Faults are additive, never subtractive.
+#+END_QUOTE
+
+** Port Assignments
+
+| Port | Role                     | Bound to    | Config source                   |
+|------+--------------------------+-------------+---------------------------------|
+| 8474 | Toxiproxy REST control   | 0.0.0.0     | ~docker/docker-compose.yml~     |
+| 9001 | GitHub API proxy         | 0.0.0.0     | ~toxiproxy/config.json~         |
+| 9002 | Ollama proxy             | 0.0.0.0     | ~toxiproxy/config.json~         |
+| 9003 | PokeAPI proxy            | 0.0.0.0     | ~toxiproxy/config.json~         |
+| 4010 | Prism mock (internal)    | 0.0.0.0     | ~docker/docker-compose.prism.yml~ |
+|11434 | Ollama (host process)    | localhost    | Host OS (not managed by Compose) |
+
+Port 4010 is only exposed within the Docker network (~expose~, not ~ports~) and
+is used exclusively by Toxiproxy when running in Prism mock mode
+(~config.prism.json~ routes ~pokeapi~ upstream to ~prism_pokeapi:4010~).
+
+** Docker Networking
+
+The project uses Docker Compose bridge networking with one critical distinction
+for the Ollama upstream.
+
+*** Bridge Mode (Default)
+
+~docker/docker-compose.yml~ defines a single service (~toxiproxy~). Docker
+Compose creates an implicit bridge network. The container's published ports
+(8474, 9001-9003) are accessible from the host at ~localhost~.
+
+*** host.docker.internal for Host Services
+
+Ollama runs as a host process on port 11434, not as a Docker container.
+The Toxiproxy container cannot reach the host's ~localhost~ directly. The
+~toxiproxy/config.json~ file uses ~host.docker.internal:11434~ as the Ollama
+upstream address:
+
+#+BEGIN_SRC json
+{
+  "name": "ollama",
+  "listen": "0.0.0.0:9002",
+  "upstream": "host.docker.internal:11434",
+  "enabled": true
+}
+#+END_SRC
+
+Note: ~spec.org~ tangles the upstream as ~localhost:11434~, but the actual
+deployed ~toxiproxy/config.json~ correctly uses ~host.docker.internal:11434~.
+This is necessary because inside the Docker bridge network, ~localhost~ resolves
+to the container itself, not the host. On Docker Desktop for macOS and Windows,
+~host.docker.internal~ resolves to the host machine. On Linux, you may need
+~--add-host=host.docker.internal:host-gateway~ or ~extra_hosts~ in Compose.
+
+*** Prism Compose Network
+
+~docker/docker-compose.prism.yml~ defines two services (~prism_pokeapi~ and
+~toxiproxy~) on the same implicit bridge network. The Toxiproxy container
+reaches Prism via Docker DNS at ~prism_pokeapi:4010~. The ~depends_on~
+directive ensures Prism starts before Toxiproxy.
+
+* Architecture Decision Records
+:PROPERTIES:
+:CUSTOM_ID: adrs
+:END:
+
+** ADR-001: TCP Proxy (Toxiproxy) over HTTP Proxy (mitmproxy, Envoy)
+:PROPERTIES:
+:CUSTOM_ID: adr-001
+:END:
+
+*** Status
+Accepted.
+
+*** Context
+The project needs a programmable fault-injection layer between test clients and
+upstream APIs. Candidates considered:
+
+- *Toxiproxy* (Shopify): TCP-level proxy with REST control API. Fault primitives
+  operate on raw byte streams (latency, bandwidth, timeout, slicer, etc.).
+- *mitmproxy*: HTTP/HTTPS-aware proxy with TLS interception. Full request/response
+  inspection and modification.
+- *Envoy Proxy*: L4/L7 proxy with fault injection filter. Production-grade service
+  mesh building block.
+
+*** Decision
+Use Toxiproxy as the sole proxy layer.
+
+*** Rationale
+
+1. *Simplicity*: Toxiproxy has a single binary, a JSON config file, and a REST
+   API with five endpoints. No certificate generation, no filter chain config,
+   no xDS control plane. The entire control layer is 80 lines of Python
+   (~fault_control/toxiproxy.py~).
+
+2. *Deterministic fault primitives*: Toxiproxy's toxics operate at TCP level with
+   precise, measurable semantics. The latency toxic uses timestamp-aware delay
+   (~sleep = delay() - time.Since(c.Timestamp)~) that prevents compounding.
+   See C-001 research in ~CONJECTURES.md~.
+
+3. *Test-scoped lifecycle*: Toxics are added and removed per-test via REST calls,
+   with an ~autouse~ pytest fixture (~tests/conftest.py~) that calls ~reset_all()~
+   before and after each test. No proxy restart needed.
+
+4. *No TLS requirement for local testing*: The three upstreams are either local
+   (Ollama on localhost) or public APIs where TLS termination is handled by the
+   upstream server. Clients talk plain HTTP to Toxiproxy listen ports; Toxiproxy
+   forwards raw TCP to the upstream. This is acceptable for local fault-injection
+   testing.
+
+*** Consequences
+
+- *TLS termination gap*: Toxiproxy does not terminate TLS. When proxying to HTTPS
+  upstreams (api.github.com:443, pokeapi.co:443), the client sends plain HTTP to
+  the proxy port. The upstream receives raw TCP bytes that are not a valid TLS
+  handshake, which may cause HTTP 400 responses or connection resets in certain
+  conditions. See "Known Limitations" section below.
+- *No HTTP-level fault injection*: Cannot inject HTTP-specific faults like
+  modified response headers, status code overrides, or request rewriting. All
+  faults are at the TCP stream level.
+- *No request routing*: Toxiproxy is a 1:1 proxy (one listen port to one
+  upstream). There is no path-based routing, load balancing, or service
+  discovery.
+
+*** Alternatives Not Chosen
+
+- *mitmproxy*: Would solve the TLS gap and enable HTTP-level faults, but requires
+  CA certificate setup, increases client complexity (proxy configuration or cert
+  trust), and its fault injection capabilities are less deterministic at the
+  timing level.
+- *Envoy*: Production-grade but dramatically over-scoped. Fault injection filter
+  works at L7 but requires extensive YAML configuration and introduces a complex
+  dependency. Explicit anti-goal in ~CLAUDE.md~: "Do not build a service mesh."
+
+** ADR-002: Docker Compose for Local Dev
+:PROPERTIES:
+:CUSTOM_ID: adr-002
+:END:
+
+*** Status
+Accepted.
+
+*** Context
+The project needs container orchestration for Toxiproxy (always) and Prism
+(optionally). The development environment is a single developer workstation.
+
+*** Decision
+Use Docker Compose v2 with two Compose files:
+- ~docker/docker-compose.yml~ -- Toxiproxy only (default)
+- ~docker/docker-compose.prism.yml~ -- Toxiproxy + Prism (offline mock mode)
+
+*** Rationale
+
+1. *Single-node scope*: This is a local testing tool, not a distributed system.
+   There is no multi-node deployment, no service discovery, no rolling updates.
+   Docker Compose handles single-node multi-container orchestration exactly.
+
+2. *Compose file per topology*: The default Compose file runs Toxiproxy against
+   live upstreams. The Prism Compose file replaces the PokeAPI upstream with a
+   local mock. This avoids conditional logic or environment variable gymnastics.
+
+3. *Ollama runs on host*: Ollama requires direct GPU access and is not
+   containerized. Docker Compose manages only the proxy/mock containers; Ollama
+   is a prerequisite, not a managed service. This keeps the Compose files simple.
+
+*** Consequences
+
+- *No Kubernetes*: The project cannot be deployed to a Kubernetes cluster without
+  writing manifests. This is acceptable per the anti-goals in ~CLAUDE.md~.
+- *No Swarm*: Docker Swarm mode is not used. ~version: "3.9"~ in the Compose
+  files is for schema compatibility, not Swarm deployment.
+- *Linux networking caveat*: ~host.docker.internal~ works out of the box on Docker
+  Desktop (macOS/Windows) but requires extra configuration on Linux. See the
+  networking section above.
+
+** ADR-003: Python requests over httpx/aiohttp
+:PROPERTIES:
+:CUSTOM_ID: adr-003
+:END:
+
+*** Status
+Accepted.
+
+*** Context
+The test client and control layer need an HTTP library. Options: ~requests~
+(synchronous), ~httpx~ (sync + async), ~aiohttp~ (async only).
+
+*** Decision
+Use ~requests~ exclusively for both the control layer (~fault_control/toxiproxy.py~)
+and the test client code (~tests/test_*.py~).
+
+*** Rationale
+
+1. *Synchronous execution for deterministic timing*: Fault injection tests measure
+   wall-clock time (~time.monotonic()~) to validate that toxics produce the
+   expected degradation. Synchronous ~requests~ calls block the calling thread,
+   making elapsed-time assertions straightforward. Async clients introduce event
+   loop scheduling jitter that complicates timing assertions.
+
+2. *Simplicity*: ~requests~ is the most widely understood Python HTTP library. The
+   control layer is 80 lines. No ~async/await~, no event loop management, no
+   connection pool configuration.
+
+3. *Single-request scenarios*: Per ~CLAUDE.md~ anti-goals, this is not a load
+   testing tool. Each test makes 1-5 sequential requests. Connection pooling,
+   HTTP/2, and async concurrency provide no benefit.
+
+*** Consequences
+
+- ~pyproject.toml~ lists ~requests~ as the sole HTTP dependency.
+- The control layer uses ~requests.get~, ~requests.post~, ~requests.delete~, and
+  ~requests.patch~ directly. No session objects, no retry adapters.
+- If the project later needs concurrent fault scenarios (e.g., multiple clients
+  hitting the proxy simultaneously), ~httpx~ or ~aiohttp~ would be required.
+
+** ADR-004: Prism for Offline Mock
+:PROPERTIES:
+:CUSTOM_ID: adr-004
+:END:
+
+*** Status
+Accepted with caveats.
+
+*** Context
+Running tests against live PokeAPI requires internet connectivity and is subject
+to rate limits and availability. An offline mock would enable CI and air-gapped
+development.
+
+*** Decision
+Use Stoplight Prism 4 as an OpenAPI-spec-driven mock server for PokeAPI, served
+via ~docker/docker-compose.prism.yml~ with Toxiproxy routing to
+~prism_pokeapi:4010~ instead of ~pokeapi.co:443~.
+
+*** Rationale
+
+1. *Spec-driven*: Prism generates responses from the PokeAPI OpenAPI spec
+   (~specs/pokeapi.yaml~). No hand-written fixtures. Response schemas match the
+   spec by construction.
+
+2. *Composable with Toxiproxy*: Prism sits as the upstream behind Toxiproxy.
+   The test client code and toxic configuration are identical whether the upstream
+   is live PokeAPI or Prism. The proxy chain is the same; only the upstream
+   address changes.
+
+3. *Offline CI*: The Prism Compose file enables fully offline test execution.
+   No external network calls, no API keys, no rate limits.
+
+*** Caveats (from C-004 Research)
+
+Conjecture C-004 ("Prism mock + Toxiproxy fully replaces live PokeAPI for test
+scenarios") was evaluated as *LIKELY FALSE as stated* in ~CONJECTURES.md~. Five
+independent failure modes were identified:
+
+| Failure Mode                | Root Cause                                        |
+|-----------------------------+---------------------------------------------------|
+| Name-based assertions fail  | Prism generates schema-valid but synthetic data;  |
+|                             | ~data["name"] == "pikachu"~ never matches         |
+| Trailing slash mismatch     | PokeAPI spec paths may differ from test URLs      |
+| Array length assertions     | ~len(results) == 100~ incompatible with Prism's   |
+|                             | generated array sizes                             |
+| Nullable field handling     | ~base_experience~ returns null from Prism          |
+| Semantic 404 impossible     | Prism cannot return 404 for ~notapokemon~ since   |
+|                             | it does not have a real data store                |
+
+*** Recommendation
+
+Narrow C-004 to *schema-structure equivalence*: Prism is suitable for testing
+that the client handles well-formed responses correctly and that Toxiproxy faults
+affect response delivery. Value-level assertions (~== "pikachu"~, ~== 100~) must
+be relaxed or skipped when running against Prism. Create a separate
+~tests/test_pokeapi_prism.py~ with shape-only assertions, or use pytest markers
+to conditionally skip value assertions.
+
+* Known Limitations and Mitigations
+:PROPERTIES:
+:CUSTOM_ID: limitations
+:END:
+
+** TLS Termination Gap
+
+*** Problem
+
+Toxiproxy operates at TCP layer 4. It does not perform TLS termination or
+origination. Two of the three upstreams use HTTPS:
+
+| Proxy   | Upstream            | Protocol Issue                                  |
+|---------+---------------------+-------------------------------------------------|
+| github  | api.github.com:443  | Client sends HTTP to proxy; upstream expects TLS |
+| pokeapi | pokeapi.co:443      | Client sends HTTP to proxy; upstream expects TLS |
+| ollama  | localhost:11434     | Both sides are plain HTTP -- no issue            |
+
+When the client sends ~GET http://localhost:9001/repos/octocat/Hello-World~,
+Toxiproxy forwards the raw HTTP bytes to ~api.github.com:443~. The GitHub
+server sees a non-TLS connection on its TLS port. In practice, GitHub returns
+an HTTP 400 ("Bad Request") because it can parse the plaintext HTTP but rejects
+it on a TLS-only endpoint. Other servers may reset the connection immediately.
+
+*** Why It Works Anyway (Sometimes)
+
+Some HTTPS endpoints have fallback behavior or return error responses in
+plaintext. The spec tests (~tests/test_github.py~, ~tests/test_pokeapi.py~)
+depend on this behavior, which is undocumented and upstream-dependent. If
+upstream servers change their TLS enforcement, these tests will break.
+
+*** Mitigation Options
+
+| Option                    | Complexity | Trade-off                            |
+|---------------------------+------------+--------------------------------------|
+| *mitmproxy sidecar*       | Medium     | Adds TLS termination; requires CA    |
+|                           |            | cert trust on the client side        |
+| *stunnel*                 | Medium     | TLS tunnel between Toxiproxy and     |
+|                           |            | upstream; no client-side changes     |
+| *Prism mock*              | Low        | Replaces live upstream with local    |
+|                           |            | HTTP mock; loses value fidelity      |
+| *Local HTTP servers*      | Low        | Run upstream-compatible HTTP servers |
+|                           |            | locally; only feasible for simple APIs|
+| *Accept the constraint*   | None       | Document it; test against Prism or   |
+|                           |            | Ollama (HTTP) for reliable results   |
+
+Current project stance: accept the constraint for GitHub and PokeAPI live tests;
+use Prism for reliable offline testing of PokeAPI.
+
+** Docker Networking Gotchas
+
+*** localhost vs host.docker.internal
+
+Inside a Docker container, ~localhost~ refers to the container itself, not the
+host machine. The ~toxiproxy/config.json~ must use ~host.docker.internal~ to
+reach Ollama on the host:
+
+- Correct: ~"upstream": "host.docker.internal:11434"~
+- Incorrect: ~"upstream": "localhost:11434"~ (would try to connect to port 11434
+  inside the Toxiproxy container, which has nothing listening there)
+
+Note: ~spec.org~ tangles the config with ~localhost:11434~. The deployed
+~toxiproxy/config.json~ has been corrected to ~host.docker.internal:11434~.
+If re-tangling from spec, this must be manually corrected or the spec updated.
+
+*** Linux-Specific Configuration
+
+On Linux hosts without Docker Desktop, ~host.docker.internal~ may not resolve.
+Add to the Compose service definition:
+
+#+BEGIN_SRC yaml
+services:
+  toxiproxy:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+#+END_SRC
+
+*** Container-to-Container DNS
+
+In the Prism Compose file (~docker/docker-compose.prism.yml~), Toxiproxy reaches
+Prism via Docker's internal DNS using the service name ~prism_pokeapi~. This
+works because both services are on the same Compose-managed bridge network. The
+~depends_on~ directive ensures startup ordering but does not guarantee readiness;
+Prism may still be loading the OpenAPI spec when Toxiproxy attempts its first
+connection. Toxiproxy handles this gracefully (connection refused is retried by
+the client).
+
+* Deployment Topology
+:PROPERTIES:
+:CUSTOM_ID: deployment
+:END:
+
+** Local Development (Current)
+
+This is the only topology currently implemented.
+
+#+BEGIN_SRC text
+  Developer workstation
+  =====================
+
+  +-------------------+      +------------------------------+
+  |  Host OS          |      |  Docker (bridge network)     |
+  |                   |      |                              |
+  |  Python tests     |      |  +------------------------+  |
+  |  (pytest)    --------9001-->|                        |  |
+  |              --------9002-->|     Toxiproxy          |  |
+  |              --------9003-->|                        |  |
+  |              --------8474-->|  (control API)         |  |
+  |                   |      |  +------------------------+  |
+  |                   |      |       |          |           |
+  |  Ollama     <-----------11434    |          |           |
+  |  (host)           |      |       |          |           |
+  +-------------------+      |       v          v           |
+                             |   api.github   pokeapi      |
+                             |   .com:443     .co:443       |
+                             +------------------------------+
+#+END_SRC
+
+*** Prerequisites
+- Docker and Docker Compose v2 installed
+- Ollama running on host with models pulled:
+  ~ollama pull qwen3:0.6b && ollama pull nomic-embed-text~
+- Python 3.11+ with ~uv~ for package management
+- ~uv sync~ to install ~requests~, ~pytest~, ~matplotlib~
+
+*** Startup Sequence
+#+BEGIN_SRC bash
+# 1. Start Toxiproxy (live upstreams)
+docker compose -f docker/docker-compose.yml up -d
+
+# 2. Verify control API
+curl -s http://localhost:8474/proxies | python3 -m json.tool
+
+# 3. Run tests
+pytest tests/ -v
+
+# Alternatively, for offline PokeAPI testing with Prism:
+# Fetch the OpenAPI spec first
+bash scripts/fetch-specs.sh
+docker compose -f docker/docker-compose.prism.yml up -d
+pytest tests/test_pokeapi.py -v
+#+END_SRC
+
+** CI/CD (GitHub Actions)
+
+Not yet implemented. Recommended configuration:
+
+#+BEGIN_SRC yaml
+# .github/workflows/test.yml
+name: Fault Injection Tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Toxiproxy + Prism
+        run: |
+          bash scripts/fetch-specs.sh
+          docker compose -f docker/docker-compose.prism.yml up -d
+          # Wait for Toxiproxy control API
+          timeout 30 bash -c 'until curl -s http://localhost:8474/proxies; do sleep 1; done'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pytest matplotlib
+
+      - name: Run PokeAPI tests (Prism mock)
+        run: pytest tests/test_pokeapi.py -v
+
+      # Note: GitHub and Ollama tests cannot run in CI without
+      # additional configuration (live API access / Ollama sidecar)
+#+END_SRC
+
+*** CI Constraints
+- *GitHub API tests*: Require live internet. May hit rate limits. Could use a
+  GitHub API mock (not yet built) or skip in CI.
+- *Ollama tests*: Require a running Ollama instance with GPU. Not feasible in
+  standard GitHub Actions runners. Would require a self-hosted runner with GPU
+  or a pre-built Ollama Docker image (available but large).
+- *PokeAPI tests*: Fully testable offline via Prism. This is the recommended
+  CI target.
+
+** Cloud Deployment (ECS/Fargate -- Hypothetical)
+
+If the fault-injection pattern were scaled to a production testing environment
+(e.g., integration testing in a staging VPC), the recommended AWS architecture
+uses the *sidecar pattern* on ECS/Fargate.
+
+#+BEGIN_SRC text
+  ECS Task Definition
+  ====================
+
+  +------------------------------------------+
+  |  Task                                    |
+  |                                          |
+  |  +----------------+  +-----------------+ |
+  |  | App Container  |  | Toxiproxy       | |
+  |  | (test runner)  |  | (sidecar)       | |
+  |  |                |  |                 | |
+  |  | localhost:9001 --> | :9001 -> upstream|
+  |  | localhost:9002 --> | :9002 -> upstream|
+  |  | localhost:9003 --> | :9003 -> upstream|
+  |  | localhost:8474 --> | :8474 (control) | |
+  |  +----------------+  +-----------------+ |
+  |                                          |
+  +------------------------------------------+
+#+END_SRC
+
+*** ECS Sidecar Configuration Notes
+
+- Both containers share the task's network namespace (~awsvpc~ mode). The app
+  container reaches Toxiproxy at ~localhost~, identical to the local dev
+  topology.
+- Toxiproxy config is injected via a bind mount from S3 or as an embedded
+  config in the task definition.
+- Upstream addresses change from ~host.docker.internal~ (Ollama) and public DNS
+  (GitHub, PokeAPI) to VPC-internal endpoints or PrivateLink.
+- For Ollama in cloud, use an EC2 GPU instance with Ollama running as a
+  systemd service, reachable via a private ALB or direct IP.
+- Toxiproxy control API (8474) must NOT be exposed outside the task. No
+  public-facing port mapping.
+
+*** Fargate Task Resource Sizing
+
+| Container  | CPU    | Memory | Notes                              |
+|------------+--------+--------+------------------------------------|
+| Test runner| 512    | 1024MB | Python pytest, low resource needs   |
+| Toxiproxy  | 256    | 512MB  | Minimal footprint, TCP relay only   |
+
+*** Why Not Lambda
+
+AWS Lambda does not support sidecar containers. The test runner needs a
+persistent TCP connection to Toxiproxy across multiple test invocations.
+Lambda's execution model (single invocation, no persistent processes) is
+incompatible.
+
+* Security Considerations
+:PROPERTIES:
+:CUSTOM_ID: security
+:END:
+
+** Toxiproxy Control API Exposure
+
+The Toxiproxy REST API on port 8474 has *no authentication or authorization*.
+Any client that can reach this port can:
+
+- List all proxies and their configurations
+- Add, modify, or remove toxics on any proxy
+- Disable or enable proxies
+- Effectively man-in-the-middle all proxied traffic
+
+*** Current Configuration
+
+~docker/docker-compose.yml~ publishes port 8474 on ~0.0.0.0~:
+
+#+BEGIN_SRC yaml
+ports:
+  - "8474:8474"
+#+END_SRC
+
+This binds to all interfaces on the host, making the control API accessible
+from the local network.
+
+*** Recommendation
+
+For local development, bind to localhost only:
+
+#+BEGIN_SRC yaml
+ports:
+  - "127.0.0.1:8474:8474"
+  - "127.0.0.1:9001:9001"
+  - "127.0.0.1:9002:9002"
+  - "127.0.0.1:9003:9003"
+#+END_SRC
+
+For any non-local deployment (CI, cloud), the control API port must not be
+exposed outside the task/pod/host boundary. In the ECS sidecar pattern
+described above, port 8474 is only reachable within the task's network
+namespace -- this is correct by default with ~awsvpc~ mode and no port
+mappings in the service definition.
+
+** No Secrets in Configuration
+
+The project stores no secrets, API keys, or credentials in any configuration
+file:
+
+| File                          | Sensitive data | Notes                       |
+|-------------------------------+----------------+-----------------------------|
+| ~toxiproxy/config.json~       | None           | Upstream addresses only     |
+| ~toxiproxy/config.prism.json~ | None           | Internal Docker DNS name    |
+| ~docker/docker-compose.yml~   | None           | Image refs and port maps    |
+| ~pyproject.toml~              | None           | Package metadata            |
+
+GitHub API tests use unauthenticated endpoints (~/repos/octocat/Hello-World~).
+Ollama has no authentication. PokeAPI is public. If authenticated upstreams are
+added in the future, credentials must be passed via environment variables or
+Docker secrets, never committed to configuration files.
+
+** Network Exposure Surface
+
+| Port  | Service          | Protocol | Auth | Network exposure      |
+|-------+------------------+----------+------+-----------------------|
+| 8474  | Toxiproxy API    | HTTP     | None | 0.0.0.0 (all ifaces)  |
+| 9001  | GitHub proxy     | TCP      | None | 0.0.0.0 (all ifaces)  |
+| 9002  | Ollama proxy     | TCP      | None | 0.0.0.0 (all ifaces)  |
+| 9003  | PokeAPI proxy    | TCP      | None | 0.0.0.0 (all ifaces)  |
+| 4010  | Prism mock       | HTTP     | None | Container-only         |
+| 11434 | Ollama (host)    | HTTP     | None | localhost (host only)  |
+
+In a shared or cloud environment, all ports except 4010 and 11434 should be
+restricted to ~127.0.0.1~ or security group rules.
+
+* Appendix: File Reference
+:PROPERTIES:
+:CUSTOM_ID: file-reference
+:END:
+
+| File                                | Purpose                                  |
+|-------------------------------------+------------------------------------------|
+| ~spec.org~                           | Canonical specification; tangles all code |
+| ~CLAUDE.md~                          | Meta-prompt; architecture decisions       |
+| ~CONJECTURES.md~                     | Conjecture tracking (C-001 through C-005) |
+| ~docker/docker-compose.yml~          | Toxiproxy container (live upstreams)      |
+| ~docker/docker-compose.prism.yml~    | Toxiproxy + Prism (offline mock)          |
+| ~toxiproxy/config.json~              | Proxy definitions (3 named proxies)       |
+| ~toxiproxy/config.prism.json~        | Proxy definition for Prism upstream       |
+| ~fault_control/toxiproxy.py~         | Python REST control layer                 |
+| ~tests/conftest.py~                  | pytest fixtures (autouse toxic reset)     |
+| ~tests/test_github.py~              | GitHub API fault scenarios (5 tests)      |
+| ~tests/test_ollama.py~              | Ollama fault scenarios (5 tests)          |
+| ~tests/test_pokeapi.py~             | PokeAPI fault scenarios (7 tests)         |
+| ~specs/pokeapi.yaml~                | PokeAPI OpenAPI spec (fetched via script) |
+| ~scripts/fetch-specs.sh~            | Downloads PokeAPI OpenAPI spec            |
+| ~pyproject.toml~                     | Python project metadata and dependencies  |
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

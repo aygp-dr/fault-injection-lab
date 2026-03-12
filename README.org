@@ -1,0 +1,326 @@
+#+TITLE: Fault Injection Lab
+#+SUBTITLE: Toxiproxy in front of real APIs for deterministic fault testing
+#+AUTHOR: aygp-dr
+#+DATE: 2026-03-11
+#+STARTUP: overview indent
+#+OPTIONS: toc:3 num:t
+
+* Overview
+
+Fault Injection Lab places [[https://github.com/Shopify/toxiproxy][Toxiproxy]] in front of real upstream APIs and
+provides a Python control layer and pytest test suite for injecting
+network faults deterministically. The pattern is the same across all
+three examples: a Docker-managed Toxiproxy instance listens on a local
+port, forwards traffic to the real upstream, and exposes a REST control
+plane on =:8474= for adding and removing toxics per test.
+
+The project uses org-mode literate programming. All source code tangles
+from =spec.org= via org-babel.
+
+Current test status:
+
+| Suite       | Upstream          | Proxy Port | Tests | Status     | Blocker        |
+|-------------+-------------------+------------+-------+------------+----------------|
+| Ollama      | =localhost:11434= | =:9002=    | 5/5   | *Passing*  | None           |
+| GitHub API  | =api.github.com=  | =:9001=    | 2/5   | Partial    | TLS (HTTPS)    |
+| PokeAPI     | =pokeapi.co=      | =:9003=    | 0/7   | Blocked    | TLS (HTTPS)    |
+
+Ollama is the only fully working suite because it exposes a plain HTTP
+upstream. The HTTPS upstreams (GitHub, PokeAPI) are blocked by the TLS
+termination constraint described in [[#known-limitations][Known Limitations]].
+
+* Architecture
+
+#+BEGIN_SRC
+  pytest test suite
+       |
+       | fixture injection
+       v
+  fault_control/toxiproxy.py  ----REST :8474---->  Toxiproxy (Docker)
+                                                     |
+                                                     | TCP forward
+                                                     v
+                                               Real Upstream
+                                          (GitHub / Ollama / PokeAPI)
+
+  Client code  ----http://localhost:PORT---->  Toxiproxy  ---->  Upstream
+#+END_SRC
+
+#+BEGIN_SRC mermaid :file ./toxi-overview.png :exports results
+graph LR
+    Client -->|"localhost:PORT"| Toxiproxy
+    Toxiproxy -->|upstream| RealAPI["Real API<br/>(GitHub / Ollama / PokéAPI)"]
+    PythonCtl["fault_control/<br/>ToxiproxyController"] -->|"REST :8474"| Toxiproxy
+    pytest -->|fixture| PythonCtl
+#+END_SRC
+
+Key design invariant: with no toxics enabled, behavior through the proxy
+is indistinguishable from a direct connection. Faults are additive --
+removing a toxic fully restores the clean path.
+
+* Quick Start
+
+** Prerequisites
+
+- Docker and Docker Compose v2
+- Python 3.11+ with [[https://docs.astral.sh/uv/][uv]]
+- Ollama running on the host with models pulled:
+
+#+BEGIN_SRC bash
+ollama pull qwen3:0.6b
+ollama pull nomic-embed-text
+#+END_SRC
+
+** Setup and Run
+
+#+BEGIN_SRC bash
+# Clone
+git clone https://github.com/aygp-dr/fault-injection-lab.git
+cd fault-injection-lab
+
+# Install Python dependencies
+uv sync
+
+# Start Toxiproxy
+docker compose -f docker/docker-compose.yml up -d
+
+# Verify Toxiproxy is healthy
+curl -s http://localhost:8474/proxies | python3 -m json.tool
+
+# Run the Ollama test suite (5/5 passing)
+uv run pytest tests/test_ollama.py -v
+
+# Run all tests (Ollama passes; GitHub/PokeAPI partially blocked by TLS)
+uv run pytest tests/ -v
+#+END_SRC
+
+** Tangle from Spec (Optional)
+
+If you modify =spec.org=, re-tangle to regenerate source files:
+
+#+BEGIN_SRC
+M-x org-babel-tangle  (in Emacs with spec.org open)
+#+END_SRC
+
+* Project Structure
+
+#+BEGIN_SRC
+fault-injection-lab/
++-- spec.org                        # Canonical spec (literate source for all code)
++-- CLAUDE.md                       # Agent meta-prompt with build order
++-- CONJECTURES.md                  # Research verdicts for C-001 through C-005
++-- AGENTS.md                       # bd issue tracking instructions
++-- pyproject.toml                  # Python project config (requests, pytest, matplotlib)
++-- fault_control/
+|   +-- __init__.py
+|   +-- toxiproxy.py                # ToxiproxyController: REST control layer
++-- tests/
+|   +-- conftest.py                 # Shared fixtures (clean_toxics, toxi)
+|   +-- test_github.py              # GitHub API fault scenarios (5 tests)
+|   +-- test_ollama.py              # Ollama fault scenarios (5 tests, all passing)
+|   +-- test_pokeapi.py             # PokeAPI fault scenarios (7 tests)
++-- docker/
+|   +-- docker-compose.yml          # Toxiproxy container
+|   +-- docker-compose.prism.yml    # Prism mock + Toxiproxy for offline PokéAPI
++-- toxiproxy/
+|   +-- config.json                 # Proxy definitions (github, ollama, pokeapi)
+|   +-- config.prism.json           # Proxy config for Prism mock upstream
++-- scripts/
+|   +-- github-smoke.sh             # Manual smoke test for GitHub proxy
+|   +-- fetch-specs.sh              # Download PokéAPI OpenAPI spec
+|   +-- bench_latency_sweep.py      # Latency injection sweep benchmark
+|   +-- bench_bandwidth_sweep.py    # Bandwidth throttle sweep
+|   +-- bench_embed_sla_gate.py     # RTB SLA gate benchmark
+|   +-- bench_slicer_sweep.py       # Slicer chunk size sweep
+|   +-- bench_common.py             # Shared benchmark utilities
++-- results/
+|   +-- latency_sweep.json          # Sweep output data
+|   +-- latency_sweep.png           # Sweep visualization
++-- docs/
+|   +-- conjecture-c001-research.md # C-001 deep dive (latency additivity)
+|   +-- conjecture-c002-research.md # C-002 deep dive (RTB SLA)
+|   +-- conjecture-c003-research.md # C-003 deep dive (slicer JSON validity)
+|   +-- conjecture-c004-research.md # C-004 deep dive (Prism mock equivalence)
+|   +-- conjecture-c005-research.md # C-005 deep dive (bandwidth proportionality)
+|   +-- meta-prompt-v0-review.md    # Review findings for agent meta-prompt
++-- bin/
+|   +-- health-check.sh             # Infrastructure health check
++-- worktrees/                      # sb worktree directory
+#+END_SRC
+
+* Toxic Types
+:PROPERTIES:
+:CUSTOM_ID: toxic-types
+:END:
+
+The control layer (=fault_control/toxiproxy.py=) wraps these Toxiproxy
+toxic types via REST:
+
+| Toxic     | Method              | Effect                            | Key Attributes                    | Example                                 |
+|-----------+---------------------+-----------------------------------+-----------------------------------+-----------------------------------------|
+| latency   | =add_latency()=     | Fixed delay +/- jitter            | =latency= (ms), =jitter= (ms)    | =toxi.add_latency("ollama", 300, 20)=  |
+| bandwidth | =add_bandwidth()=   | Caps throughput in KB/s           | =rate= (KB/s)                     | =toxi.add_bandwidth("github", 1)=      |
+| timeout   | =add_timeout()=     | Drops connection after delay      | =timeout= (ms)                    | =toxi.add_timeout("ollama", 2000)=     |
+| slicer    | =add_slicer()=      | Fragments TCP into small chunks   | =average_size= (bytes), =delay= (us) | =toxi.add_slicer("ollama", 1, 500)= |
+| disable   | =disable()=         | Proxy refuses all connections     | (proxy-level, not a toxic)        | =toxi.disable("pokeapi")=              |
+
+All toxics are applied =downstream= (server-to-client direction). The
+=clean_toxics= autouse fixture in =tests/conftest.py= calls =reset_all()=
+before and after each test to ensure isolation.
+
+* Examples
+
+** Example 1: GitHub API (=api.github.com=)
+:PROPERTIES:
+:CUSTOM_ID: github
+:END:
+
+Toxiproxy at =:9001= forwards to =api.github.com:443=. The test suite
+validates client behavior under latency injection (300ms added delay),
+bandwidth throttling (1 KB/s cap on commit listing), timeout (500ms
+connection drop), and full proxy disable. The latency test measures
+wall-clock delta between baseline and degraded requests, asserting the
+shift falls within the expected 250--400ms window. *Status*: 2/5 tests
+pass. The 3 HTTPS-dependent tests fail because Toxiproxy forwards raw
+TCP and cannot negotiate TLS on behalf of the client -- the client
+sends plaintext HTTP to port 9001, but =api.github.com:443= expects a
+TLS handshake.
+
+** Example 2: Ollama (=localhost:11434=)
+:PROPERTIES:
+:CUSTOM_ID: ollama
+:END:
+
+Toxiproxy at =:9002= forwards to =host.docker.internal:11434= (Ollama on
+the host). This is the fully working suite (5/5 passing) because Ollama
+exposes plain HTTP. Tests cover: baseline embedding latency under the
+100ms RTB SLA gate (=nomic-embed-text=), latency injection pushing
+embeddings past the SLA threshold, TCP slicer at 1-byte chunks
+validating JSON reassembly after fragmentation, timeout mid-generation
+causing =ConnectionError=, and bandwidth cap (10 KB/s) throttling verbose
+generation output. The RTB SLA test is directly relevant to real-time
+bidding workloads where embedding latency is a hard constraint.
+
+** Example 3: PokeAPI (=pokeapi.co=)
+:PROPERTIES:
+:CUSTOM_ID: pokeapi
+:END:
+
+Toxiproxy at =:9003= forwards to =pokeapi.co:443=. The test suite is the
+most comprehensive (7 tests) covering baseline fetches, latency spikes
+mid-pagination, bandwidth throttling on large payloads, connection
+down/recovery retry patterns, and slicer on large list responses.
+*Status*: 0/7 tests pass against the live upstream due to the same TLS
+blocker as GitHub. The project includes a Prism mock alternative
+(=docker/docker-compose.prism.yml=) that serves the PokeAPI OpenAPI spec
+locally, eliminating the TLS problem -- though Prism mock equivalence
+has its own limitations (see C-004 in [[#conjectures][Open Conjectures]]).
+
+* Known Limitations
+:PROPERTIES:
+:CUSTOM_ID: known-limitations
+:END:
+
+** TLS Termination
+
+Toxiproxy operates at the TCP level. It forwards raw bytes between
+client and upstream without protocol awareness. For HTTPS upstreams
+(=api.github.com:443=, =pokeapi.co:443=), the proxy forwards the TCP
+stream, but the client sends plaintext HTTP to the proxy port. The
+upstream expects a TLS handshake and rejects the connection.
+
+Workarounds:
+- Use HTTP-only upstreams (Ollama works because it serves plain HTTP)
+- Use a Prism mock as an HTTP upstream (=docker-compose.prism.yml=)
+- Deploy a TLS-terminating reverse proxy (nginx, Caddy) between
+  Toxiproxy and the HTTPS upstream
+- Use a MITM certificate for local testing
+
+This is the primary blocker for the GitHub and PokeAPI test suites.
+
+** Docker Networking
+
+The Ollama proxy uses =host.docker.internal= as the upstream address in
+=toxiproxy/config.json= to reach the host-running Ollama from inside the
+Docker container. This is a Docker Desktop feature (macOS/Windows). On
+Linux, you may need =--network=host= or the =extra_hosts= Docker Compose
+directive to map =host.docker.internal= to the host IP.
+
+** Spec vs. Deployed Config
+
+The upstream address for Ollama in =spec.org= is =localhost:11434=, but
+the deployed =toxiproxy/config.json= correctly uses
+=host.docker.internal:11434= to account for Docker networking. The spec
+describes the logical intent; the config reflects the runtime topology.
+
+* Open Conjectures
+:PROPERTIES:
+:CUSTOM_ID: conjectures
+:END:
+
+Research conjectures tracked via =cprr=. Full analysis in
+=docs/conjecture-c00N-research.md=. Summary verdicts:
+
+| ID    | Hypothesis                                                        | Verdict               | Key Finding                                                                        |
+|-------+-------------------------------------------------------------------+-----------------------+------------------------------------------------------------------------------------|
+| C-001 | Latency toxic is purely additive (observed = baseline + injected) | *Likely true*         | Source confirms timestamp-aware delay prevents compounding. Single-chunk responses. |
+| C-002 | =nomic-embed-text= < 100ms through clean proxy (RTB SLA)          | *Likely true*         | Empirically ~17ms baseline. Cold-start caveat: first request after eviction.       |
+| C-003 | TCP slicer at 1-byte avg preserves JSON validity                  | *Likely true*         | Slicer sub-slices only; never drops or reorders bytes. TCP guarantees order.       |
+| C-004 | Prism mock fully replaces live PokeAPI for test scenarios          | *Likely false*        | Five failure modes: value assertions, trailing slashes, array lengths, nullables.  |
+| C-005 | Bandwidth throttle scales proportionally with payload size         | *Likely false*        | Linear in application bytes, but HTTP header overhead dominates at small payloads. |
+
+See =CONJECTURES.md= for full status and instrumentation details.
+
+* Contributing
+
+** Issue Tracking
+
+This project uses =bd= (beads, Dolt-backed) for all issue tracking. Do
+not use markdown TODO lists or external trackers.
+
+#+BEGIN_SRC bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work atomically
+bd close <id>         # Complete work
+#+END_SRC
+
+** Conjecture Tracking
+
+Use =cprr= to propose, research, and resolve conjectures. Conjectures
+follow the format =C-00N= and are logged in =CONJECTURES.md= with
+corresponding deep-dive documents in =docs/=.
+
+** Worktrees
+
+Use =sb= for managing git worktrees for parallel work streams. The
+=worktrees/= directory is reserved for this purpose.
+
+** Running Tests
+
+#+BEGIN_SRC bash
+# All tests
+uv run pytest tests/ -v
+
+# Ollama only (the passing suite)
+uv run pytest tests/test_ollama.py -v
+
+# With timing output
+uv run pytest tests/test_ollama.py -v --durations=0
+#+END_SRC
+
+* References
+:PROPERTIES:
+:CUSTOM_ID: references
+:END:
+
+- [[https://github.com/Shopify/toxiproxy][Toxiproxy]] -- TCP proxy for simulating network conditions (Shopify)
+- [[https://docs.stoplight.io/docs/prism/][Prism]] -- OpenAPI mock server (Stoplight)
+- [[https://pokeapi.co/docs/v2][PokeAPI v2 docs]] ([[https://github.com/PokeAPI/pokeapi][OpenAPI spec source]])
+- [[https://github.com/ollama/ollama/blob/main/docs/api.md][Ollama API docs]]
+- [[https://docs.github.com/en/rest][GitHub REST API docs]]
+- [[https://docs.astral.sh/uv/][uv]] -- Python package manager (Astral)
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:
