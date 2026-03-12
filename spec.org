@@ -1,0 +1,615 @@
+#+TITLE: Toxiproxy in Front of Real APIs: GitHub, Ollama, PokéAPI
+#+AUTHOR: JW
+#+DATE: 2026-03-11
+#+STARTUP: overview indent
+#+OPTIONS: toc:3 num:t
+#+PROPERTY: header-args:python  :results output :exports both
+#+PROPERTY: header-args:bash    :results output :exports both
+#+PROPERTY: header-args:yaml    :exports code
+#+PROPERTY: header-args:json    :exports code
+#+TAGS: toxiproxy prism openapi ollama github pokeapi fault-injection
+
+* Overview
+:PROPERTIES:
+:CUSTOM_ID: overview
+:END:
+
+Three worked examples of Toxiproxy sitting in front of a real upstream. The pattern
+is identical in each case — only the upstream address and scenario intent differ.
+
+#+BEGIN_SRC mermaid :file ./toxi-overview.png :exports results
+graph LR
+    Client -->|localhost:PORT| Toxiproxy
+    Toxiproxy -->|upstream| RealAPI["Real API\n(GitHub / Ollama / PokéAPI)"]
+    PythonCtl["Python control\nfault_control/"] -->|REST :8474| Toxiproxy
+    pytest -->|fixture| PythonCtl
+#+END_SRC
+
+Control plane is always ~http://localhost:8474~. Upstreams are registered by name;
+toxics are added/removed per test via REST without restarting the proxy.
+
+* Shared Infrastructure
+:PROPERTIES:
+:CUSTOM_ID: shared-infra
+:END:
+
+** docker-compose.yml
+:PROPERTIES:
+:CUSTOM_ID: compose
+:END:
+
+#+BEGIN_SRC yaml :tangle ./docker/docker-compose.yml :mkdirp t
+version: "3.9"
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8474:8474"   # REST control API
+      - "9001:9001"   # github proxy
+      - "9002:9002"   # ollama proxy
+      - "9003:9003"   # pokeapi proxy
+    volumes:
+      - ./toxiproxy/config.json:/config.json:ro
+    command: ["-config", "/config.json", "-host", "0.0.0.0"]
+#+END_SRC
+
+** toxiproxy/config.json
+:PROPERTIES:
+:CUSTOM_ID: config
+:END:
+
+#+BEGIN_SRC json :tangle ./toxiproxy/config.json :mkdirp t
+[
+  {
+    "name": "github",
+    "listen": "0.0.0.0:9001",
+    "upstream": "api.github.com:443",
+    "enabled": true
+  },
+  {
+    "name": "ollama",
+    "listen": "0.0.0.0:9002",
+    "upstream": "localhost:11434",
+    "enabled": true
+  },
+  {
+    "name": "pokeapi",
+    "listen": "0.0.0.0:9003",
+    "upstream": "pokeapi.co:443",
+    "enabled": true
+  }
+]
+#+END_SRC
+
+** fault_control/toxiproxy.py
+:PROPERTIES:
+:CUSTOM_ID: fault-control
+:END:
+
+#+BEGIN_SRC python :tangle ./fault_control/toxiproxy.py :mkdirp t
+"""Toxiproxy REST control layer."""
+import requests
+import time
+
+
+class ToxiproxyController:
+    def __init__(self, api_url: str = "http://localhost:8474"):
+        self.api = api_url
+
+    # ── toxics ────────────────────────────────────────────────────────────────
+
+    def add_latency(self, proxy: str, latency_ms: int, jitter_ms: int = 0):
+        self._post(f"/proxies/{proxy}/toxics", {
+            "name":       f"latency_{proxy}",
+            "type":       "latency",
+            "stream":     "downstream",
+            "attributes": {"latency": latency_ms, "jitter": jitter_ms},
+        })
+
+    def add_bandwidth(self, proxy: str, rate_kbps: int):
+        """Throttle to rate_kbps kilobytes/sec."""
+        self._post(f"/proxies/{proxy}/toxics", {
+            "name":       f"bw_{proxy}",
+            "type":       "bandwidth",
+            "stream":     "downstream",
+            "attributes": {"rate": rate_kbps},
+        })
+
+    def add_timeout(self, proxy: str, timeout_ms: int):
+        """Drop connection after timeout_ms with no response."""
+        self._post(f"/proxies/{proxy}/toxics", {
+            "name":       f"timeout_{proxy}",
+            "type":       "timeout",
+            "stream":     "downstream",
+            "attributes": {"timeout": timeout_ms},
+        })
+
+    def add_slicer(self, proxy: str, avg_size: int = 1, delay_us: int = 0):
+        """Break TCP stream into avg_size-byte slices with delay_us delay."""
+        self._post(f"/proxies/{proxy}/toxics", {
+            "name":       f"slicer_{proxy}",
+            "type":       "slicer",
+            "stream":     "downstream",
+            "attributes": {"average_size": avg_size, "size_variation": 0,
+                           "delay": delay_us},
+        })
+
+    def disable(self, proxy: str):
+        self._post(f"/proxies/{proxy}", {"enabled": False}, method="PATCH")
+
+    def enable(self, proxy: str):
+        self._post(f"/proxies/{proxy}", {"enabled": True}, method="PATCH")
+
+    def remove_toxic(self, proxy: str, toxic_name: str):
+        requests.delete(f"{self.api}/proxies/{proxy}/toxics/{toxic_name}")
+
+    def reset_all(self):
+        for proxy in self._get("/proxies"):
+            for toxic in self._get(f"/proxies/{proxy}/toxics"):
+                self.remove_toxic(proxy, toxic["name"])
+        # re-enable all
+        for proxy in self._get("/proxies"):
+            self.enable(proxy)
+
+    def health_check(self, timeout: int = 5) -> bool:
+        try:
+            r = requests.get(f"{self.api}/proxies", timeout=timeout)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _post(self, path: str, body: dict, method: str = "POST"):
+        fn = getattr(requests, method.lower())
+        fn(f"{self.api}{path}", json=body, timeout=5)
+
+    def _get(self, path: str) -> dict:
+        return requests.get(f"{self.api}{path}", timeout=5).json()
+#+END_SRC
+
+** tests/conftest.py
+:PROPERTIES:
+:CUSTOM_ID: conftest
+:END:
+
+#+BEGIN_SRC python :tangle ./tests/conftest.py :mkdirp t
+import pytest
+import time
+from fault_control.toxiproxy import ToxiproxyController
+
+TOXI = ToxiproxyController()
+
+@pytest.fixture(autouse=True)
+def clean_toxics():
+    TOXI.reset_all()
+    yield
+    TOXI.reset_all()
+
+@pytest.fixture
+def toxi():
+    return TOXI
+#+END_SRC
+
+* Example 1: GitHub API (~api.github.com~)
+:PROPERTIES:
+:CUSTOM_ID: github
+:END:
+
+*Use case*: Test how your GitHub client handles rate-limit throttling, slow responses,
+and outright connection drops. Useful when building integrations that must gracefully
+backoff and retry.
+
+** Scenario: rate-limit simulation via bandwidth throttle
+
+GitHub's real rate-limit returns 429 with a ~Retry-After~ header, but you can
+simulate the *effect* (very slow responses as the client chews through headers) via
+bandwidth throttling — relevant for clients that don't parse 429 properly.
+
+#+BEGIN_SRC bash :tangle ./scripts/github-smoke.sh :mkdirp t
+#!/usr/bin/env bash
+# Toxiproxy sits at :9001 → api.github.com:443
+# Note: TLS termination — for HTTPS upstreams you need to talk plain HTTP
+# to the proxy and let it handle the TCP forwarding, OR use a MITM cert.
+# Easiest local approach: use httpie with --verify=no against a local cert.
+
+# Without fault:
+curl -s --proxy "" http://localhost:9001/repos/octocat/Hello-World \
+  -H "Accept: application/vnd.github+json" | python3 -m json.tool | head -20
+#+END_SRC
+
+#+BEGIN_SRC python :tangle ./tests/test_github.py :mkdirp t
+"""GitHub API fault scenarios via Toxiproxy."""
+import time
+import pytest
+import requests
+
+PROXY_BASE = "http://localhost:9001"
+
+
+def gh(path: str) -> requests.Response:
+    return requests.get(
+        f"{PROXY_BASE}{path}",
+        headers={"Accept": "application/vnd.github+json"},
+        timeout=10,
+    )
+
+
+def test_baseline_repo_fetch():
+    """C-01 equivalent: clean path, expect 200."""
+    r = gh("/repos/octocat/Hello-World")
+    assert r.status_code == 200
+    assert r.json()["full_name"] == "octocat/Hello-World"
+
+
+def test_latency_degrades_response_time(toxi):
+    """Inject 300ms latency; confirm wall-clock shift."""
+    t0 = time.monotonic()
+    gh("/repos/octocat/Hello-World")
+    baseline = time.monotonic() - t0
+
+    toxi.add_latency("github", latency_ms=300, jitter_ms=20)
+
+    t1 = time.monotonic()
+    r = gh("/repos/octocat/Hello-World")
+    degraded = time.monotonic() - t1
+
+    assert r.status_code == 200
+    delta_ms = (degraded - baseline) * 1000
+    assert 250 < delta_ms < 400, f"Expected ~300ms delta, got {delta_ms:.0f}ms"
+
+
+def test_bandwidth_throttle_slows_large_response(toxi):
+    """1 KB/s cap; list endpoint should take >2s."""
+    toxi.add_bandwidth("github", rate_kbps=1)
+    t0 = time.monotonic()
+    r = gh("/repos/octocat/Hello-World/commits")
+    elapsed = time.monotonic() - t0
+    assert r.status_code == 200
+    assert elapsed > 2.0, f"Expected throttled response, got {elapsed:.2f}s"
+
+
+def test_timeout_raises(toxi):
+    """500ms timeout toxic; client should get a connection error."""
+    toxi.add_timeout("github", timeout_ms=500)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        requests.get(f"{PROXY_BASE}/repos/octocat/Hello-World", timeout=2)
+
+
+def test_connection_down_raises(toxi):
+    """Disable proxy entirely; all requests fail."""
+    toxi.disable("github")
+    with pytest.raises(requests.exceptions.ConnectionError):
+        requests.get(f"{PROXY_BASE}/repos/octocat/Hello-World", timeout=2)
+#+END_SRC
+
+* Example 2: Ollama (~localhost:11434~)
+:PROPERTIES:
+:CUSTOM_ID: ollama
+:END:
+
+*Use case*: Ollama is a local LLM inference server. Toxiproxy in front of it lets you
+validate that your agent/pipeline handles slow model responses, partial stream
+interruptions, and timeout/retry logic — without touching Ollama config or models.
+
+This is directly relevant to the RTB latency constraint (C-01 in adwall/bench-infra:
+~nomic-embed-text~ must be < 100ms; any latency toxic that pushes it past threshold
+should gate the experiment).
+
+** Scenario: streaming response slicer
+
+Ollama's ~generate~ endpoint streams tokens. The slicer toxic shreds the TCP stream
+into tiny chunks, simulating a model running on a throttled GPU or a lossy network
+link between inference node and gateway.
+
+#+BEGIN_SRC python :tangle ./tests/test_ollama.py :mkdirp t
+"""Ollama fault scenarios via Toxiproxy :9002 → localhost:11434."""
+import time
+import json
+import pytest
+import requests
+
+PROXY_BASE = "http://localhost:9002"
+MODEL = "qwen3:0.6b"   # adjust to what's pulled locally
+
+
+def generate(prompt: str, stream: bool = False) -> requests.Response:
+    return requests.post(
+        f"{PROXY_BASE}/api/generate",
+        json={"model": MODEL, "prompt": prompt, "stream": stream},
+        timeout=30,
+    )
+
+
+def embed(text: str) -> requests.Response:
+    return requests.post(
+        f"{PROXY_BASE}/api/embeddings",
+        json={"model": "nomic-embed-text", "prompt": text},
+        timeout=10,
+    )
+
+
+def test_baseline_embed_under_100ms():
+    """RTB gate: embedding latency must be < 100ms without fault."""
+    t0 = time.monotonic()
+    r = embed("East Boston waterfront")
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    assert r.status_code == 200
+    assert elapsed_ms < 100, f"Embedding took {elapsed_ms:.1f}ms — fails RTB SLA"
+
+
+def test_latency_pushes_embed_past_rtb_gate(toxi):
+    """50ms injected latency should push embed past 100ms threshold."""
+    toxi.add_latency("ollama", latency_ms=60, jitter_ms=5)
+    t0 = time.monotonic()
+    r = embed("East Boston waterfront")
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    assert r.status_code == 200
+    assert elapsed_ms > 100, f"Expected RTB breach, got {elapsed_ms:.1f}ms"
+
+
+def test_slicer_disrupts_streaming_generation(toxi):
+    """
+    Slicer breaks TCP stream into 1-byte chunks with 500µs delay between each.
+    Client must reassemble correctly; validate response is still parseable JSON.
+    """
+    toxi.add_slicer("ollama", avg_size=1, delay_us=500)
+    r = generate("count to three", stream=False)
+    assert r.status_code == 200
+    body = r.json()
+    assert "response" in body
+    assert len(body["response"]) > 0
+
+
+def test_timeout_mid_generation_raises(toxi):
+    """2000ms timeout toxic; long generation should not complete."""
+    toxi.add_timeout("ollama", timeout_ms=2000)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        generate("write me a sonnet about FreeBSD jails", stream=False)
+
+
+def test_bandwidth_cap_slows_large_response(toxi):
+    """10 KB/s cap on a verbose generation; must take > 1s."""
+    toxi.add_bandwidth("ollama", rate_kbps=10)
+    t0 = time.monotonic()
+    r = generate("list every US state capital", stream=False)
+    elapsed = time.monotonic() - t0
+    assert r.status_code == 200
+    assert elapsed > 1.0, f"Expected throttled response, got {elapsed:.2f}s"
+#+END_SRC
+
+** Babel block: quick Ollama latency sweep
+
+#+BEGIN_SRC python :results output :exports both
+import subprocess, json, time, statistics
+
+# requires: docker compose up -d toxiproxy
+import requests
+
+results = {}
+for latency_ms in [0, 25, 50, 100, 200]:
+    # reset toxics
+    requests.delete("http://localhost:8474/proxies/ollama/toxics/latency_ollama")
+    if latency_ms > 0:
+        requests.post("http://localhost:8474/proxies/ollama/toxics", json={
+            "name": "latency_ollama", "type": "latency", "stream": "downstream",
+            "attributes": {"latency": latency_ms, "jitter": 0},
+        })
+    times = []
+    for _ in range(5):
+        t0 = time.monotonic()
+        requests.post("http://localhost:9002/api/embeddings",
+                      json={"model": "nomic-embed-text", "prompt": "test"},
+                      timeout=10)
+        times.append((time.monotonic() - t0) * 1000)
+    results[latency_ms] = round(statistics.mean(times), 1)
+
+for injected, observed in results.items():
+    rtb = "PASS" if observed < 100 else "FAIL"
+    print(f"injected={injected:>3}ms  observed={observed:>6.1f}ms  RTB={rtb}")
+#+END_SRC
+
+* Example 3: PokéAPI (~pokeapi.co~)
+:PROPERTIES:
+:CUSTOM_ID: pokeapi
+:END:
+
+*Use case*: PokéAPI is public, unauthenticated, and has a stable OpenAPI spec — ideal
+for Prism mock + Toxiproxy pattern development without burning API rate limits or
+needing credentials. The combination of Prism (serving from spec) and Toxiproxy (fault
+layer) in front of it gives you a fully offline, fault-injectable test target.
+
+** Prism mock as upstream (offline mode)
+
+#+BEGIN_SRC yaml :tangle ./docker/docker-compose.prism.yml :mkdirp t
+version: "3.9"
+
+services:
+  # Prism serves PokéAPI spec locally — no internet needed
+  prism_pokeapi:
+    image: stoplight/prism:4
+    command: mock -h 0.0.0.0 /spec/pokeapi.yaml
+    volumes:
+      - ./specs:/spec:ro
+    expose: ["4010"]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8474:8474"
+      - "9003:9003"
+    volumes:
+      - ./toxiproxy/config.prism.json:/config.json:ro
+    command: ["-config", "/config.json", "-host", "0.0.0.0"]
+    depends_on: [prism_pokeapi]
+#+END_SRC
+
+#+BEGIN_SRC json :tangle ./toxiproxy/config.prism.json :mkdirp t
+[
+  {
+    "name": "pokeapi",
+    "listen": "0.0.0.0:9003",
+    "upstream": "prism_pokeapi:4010",
+    "enabled": true
+  }
+]
+#+END_SRC
+
+** Download the PokéAPI OpenAPI spec
+
+#+BEGIN_SRC bash :tangle ./scripts/fetch-specs.sh :mkdirp t
+#!/usr/bin/env bash
+mkdir -p specs
+curl -sL https://raw.githubusercontent.com/PokeAPI/pokeapi/master/openapi.yml \
+  -o specs/pokeapi.yaml
+echo "Saved specs/pokeapi.yaml ($(wc -l < specs/pokeapi.yaml) lines)"
+#+END_SRC
+
+** Test scenarios
+
+#+BEGIN_SRC python :tangle ./tests/test_pokeapi.py :mkdirp t
+"""
+PokéAPI fault scenarios via Toxiproxy :9003
+Works against either:
+  - real pokeapi.co (config.json)
+  - Prism mock (config.prism.json + docker-compose.prism.yml)
+"""
+import time
+import pytest
+import requests
+
+PROXY_BASE = "http://localhost:9003"
+
+
+def poke(path: str) -> requests.Response:
+    return requests.get(f"{PROXY_BASE}{path}", timeout=10)
+
+
+# ── baseline ──────────────────────────────────────────────────────────────────
+
+def test_pikachu_exists():
+    r = poke("/api/v2/pokemon/pikachu")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["name"] == "pikachu"
+    assert data["base_experience"] > 0
+
+
+def test_unknown_pokemon_404():
+    r = poke("/api/v2/pokemon/notapokemon")
+    assert r.status_code == 404
+
+
+# ── latency ───────────────────────────────────────────────────────────────────
+
+def test_latency_200ms_still_returns_data(toxi):
+    toxi.add_latency("pokeapi", latency_ms=200, jitter_ms=20)
+    t0 = time.monotonic()
+    r = poke("/api/v2/pokemon/bulbasaur")
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    assert r.status_code == 200
+    assert elapsed_ms > 180, f"Toxic not firing? elapsed={elapsed_ms:.0f}ms"
+    assert r.json()["name"] == "bulbasaur"
+
+
+def test_latency_spike_scenario(toxi):
+    """Simulate a CDN hiccup: brief 2s spike mid-paginated list."""
+    # page 1 — clean
+    r1 = poke("/api/v2/pokemon?limit=20&offset=0")
+    assert r1.status_code == 200
+
+    # spike
+    toxi.add_latency("pokeapi", latency_ms=2000, jitter_ms=100)
+    t0 = time.monotonic()
+    r2 = poke("/api/v2/pokemon?limit=20&offset=20")
+    elapsed = time.monotonic() - t0
+    assert r2.status_code == 200
+    assert elapsed > 1.8
+
+    # spike clears
+    toxi.remove_toxic("pokeapi", "latency_pokeapi")
+    r3 = poke("/api/v2/pokemon?limit=20&offset=40")
+    assert r3.status_code == 200
+
+
+# ── bandwidth ─────────────────────────────────────────────────────────────────
+
+def test_bandwidth_throttle_on_sprite_endpoint(toxi):
+    """
+    Sprite JSON includes large base64 or URLs.
+    1 KB/s cap should make even small responses take > 0.5s.
+    """
+    toxi.add_bandwidth("pokeapi", rate_kbps=1)
+    t0 = time.monotonic()
+    r = poke("/api/v2/pokemon/charizard")
+    elapsed = time.monotonic() - t0
+    assert r.status_code == 200
+    assert elapsed > 0.5
+
+
+# ── connection fault ──────────────────────────────────────────────────────────
+
+def test_retry_logic_across_down_then_up(toxi):
+    """
+    Down for 1s then re-enable. Client retry should recover.
+    Pattern: test your retry/backoff code, not just the happy path.
+    """
+    import time
+
+    toxi.disable("pokeapi")
+
+    # first attempt must fail
+    with pytest.raises(requests.exceptions.ConnectionError):
+        poke("/api/v2/pokemon/squirtle")
+
+    # re-enable after 1s
+    time.sleep(1)
+    toxi.enable("pokeapi")
+
+    # second attempt must succeed
+    r = poke("/api/v2/pokemon/squirtle")
+    assert r.status_code == 200
+    assert r.json()["name"] == "squirtle"
+
+
+def test_slicer_on_large_list(toxi):
+    """
+    Slicer with 2-byte chunks simulates a very chatty, fragmented TCP session.
+    Response must still be valid JSON after reassembly.
+    """
+    toxi.add_slicer("pokeapi", avg_size=2, delay_us=100)
+    r = poke("/api/v2/pokemon?limit=100")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["count"] > 0
+    assert len(data["results"]) == 100
+#+END_SRC
+
+* Scenario Summary
+:PROPERTIES:
+:CUSTOM_ID: summary
+:END:
+
+| Toxic        | GitHub                   | Ollama                     | PokéAPI                     |
+|--------------+--------------------------+----------------------------+-----------------------------|
+| latency      | client backoff under slow auth | RTB SLA breach gate  | CDN spike mid-pagination    |
+| bandwidth    | large diff/commit bodies | verbose generation throttle | sprite/list payload cap    |
+| timeout      | integration auth timeout | long generation abort      | (use connection down)       |
+| slicer       | streaming API consumers  | token stream fragmentation | large paginated list        |
+| disable      | failover to cached data  | fallback model path        | retry/backoff recovery      |
+
+* References
+:PROPERTIES:
+:CUSTOM_ID: refs
+:END:
+
+- [[https://github.com/Shopify/toxiproxy][Toxiproxy REST API]]
+- [[https://docs.stoplight.io/docs/prism/][Prism docs]] — mock + proxy + validation modes
+- [[https://pokeapi.co/docs/v2][PokéAPI v2 docs]] + [[https://github.com/PokeAPI/pokeapi][OpenAPI spec source]]
+- [[https://github.com/ollama/ollama/blob/main/docs/api.md][Ollama API docs]]
+- [[https://docs.github.com/en/rest][GitHub REST API docs]]
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

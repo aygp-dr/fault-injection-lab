@@ -1,0 +1,48 @@
+{
+  "conjectures": [
+    {
+      "id": 1,
+      "title": "Toxiproxy latency toxic is purely additive — observed latency = baseline + injected ± jitter, with no compounding or absorption effects",
+      "hypothesis": "Measure baseline and degraded latency across 50 requests; delta should be within injected ± jitter range for \u003e95% of samples",
+      "status": "open",
+      "created_at": "2026-03-11T20:01:09.980226-04:00",
+      "updated_at": "2026-03-11T20:01:09.980226-04:00"
+    },
+    {
+      "id": 2,
+      "title": "nomic-embed-text via Ollama meets \u003c100ms RTB SLA under clean proxy conditions",
+      "hypothesis": "Run 100 embedding requests through clean proxy; p99 latency must be \u003c100ms",
+      "status": "open",
+      "created_at": "2026-03-11T20:01:09.982688-04:00",
+      "updated_at": "2026-03-11T20:01:09.982688-04:00"
+    },
+    {
+      "id": 3,
+      "title": "TCP slicer toxic preserves JSON validity after reassembly at 1-byte avg chunk size",
+      "hypothesis": "Send 50 requests through slicer(avg_size=1); all must parse as valid JSON with identical schema",
+      "status": "open",
+      "created_at": "2026-03-11T20:01:09.985127-04:00",
+      "updated_at": "2026-03-11T20:01:09.985127-04:00"
+    },
+    {
+      "id": 4,
+      "title": "Prism mock + Toxiproxy fully replaces live PokéAPI for test scenarios",
+      "hypothesis": "All PokéAPI tests pass against Prism with same status codes; diff response schemas",
+      "status": "open",
+      "created_at": "2026-03-11T20:01:09.987319-04:00",
+      "updated_at": "2026-03-11T20:01:09.987319-04:00"
+    },
+    {
+      "id": 5,
+      "title": "Bandwidth throttle effect on response time scales proportionally with payload size",
+      "hypothesis": "Compare elapsed time for 1KB vs 10KB vs 100KB payloads at fixed 1KB/s cap; ratio should be within 20% of payload size ratio",
+      "status": "open",
+      "created_at": "2026-03-11T20:01:09.989405-04:00",
+      "updated_at": "2026-03-11T20:01:09.989405-04:00"
+    }
+  ],
+  "next_id": 6,
+  "config": {
+    "local": true
+  }
+}
