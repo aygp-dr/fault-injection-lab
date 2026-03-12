@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  # Prism serves PokéAPI spec locally — no internet needed
+  prism_pokeapi:
+    image: stoplight/prism:4
+    command: mock -h 0.0.0.0 /spec/pokeapi.yaml
+    volumes:
+      - ./specs:/spec:ro
+    expose: ["4010"]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8474:8474"
+      - "9003:9003"
+    volumes:
+      - ./toxiproxy/config.prism.json:/config.json:ro
+    command: ["-config", "/config.json", "-host", "0.0.0.0"]
+    depends_on: [prism_pokeapi]

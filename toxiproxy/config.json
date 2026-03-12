@@ -1,0 +1,20 @@
+[
+  {
+    "name": "github",
+    "listen": "0.0.0.0:9001",
+    "upstream": "api.github.com:443",
+    "enabled": true
+  },
+  {
+    "name": "ollama",
+    "listen": "0.0.0.0:9002",
+    "upstream": "localhost:11434",
+    "enabled": true
+  },
+  {
+    "name": "pokeapi",
+    "listen": "0.0.0.0:9003",
+    "upstream": "pokeapi.co:443",
+    "enabled": true
+  }
+]

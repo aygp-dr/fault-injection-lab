@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8474:8474"   # REST control API
+      - "9001:9001"   # github proxy
+      - "9002:9002"   # ollama proxy
+      - "9003:9003"   # pokeapi proxy
+    volumes:
+      - ./toxiproxy/config.json:/config.json:ro
+    command: ["-config", "/config.json", "-host", "0.0.0.0"]

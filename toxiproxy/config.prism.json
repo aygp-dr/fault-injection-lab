@@ -1,0 +1,8 @@
+[
+  {
+    "name": "pokeapi",
+    "listen": "0.0.0.0:9003",
+    "upstream": "prism_pokeapi:4010",
+    "enabled": true
+  }
+]

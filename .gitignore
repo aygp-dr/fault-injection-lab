@@ -3,3 +3,9 @@
 .dolt/
 *.db
 worktrees/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
